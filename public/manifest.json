@@ -1,0 +1,33 @@
+{
+  "id": "/",
+  "short_name": "Addition Business Centre",
+  "name": "Addition Business Centre",
+  "description": "Offline-first retail shop management and point-of-sale (POS) system with dual-currency USD/LRD, barcode scanning, and inventory tracking.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f172a",
+  "theme_color": "#1e293b",
+  "categories": ["business", "finance", "productivity"],
+  "icons": [
+    {
+      "src": "/assets/icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any"
+    },
+    {
+      "src": "/assets/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any"
+    },
+    {
+      "src": "/assets/icon-maskable-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "maskable"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "Addition Business Centre",
+  "description": "Offline-first retail shop management and point-of-sale (POS) system with dual-currency USD/LRD, barcode scanning, inventory tracking, and thermal receipt printing.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
