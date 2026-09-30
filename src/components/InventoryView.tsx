@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Package,
   Plus,
@@ -27,17 +27,23 @@ import {
   ArrowDownLeft,
   ChevronDown,
   ChevronUp,
+  Building2,
+  Boxes,
 } from 'lucide-react';
-import { BusinessSettings, Category, Product, StockBatch, StockMovement, Unit, User } from '../types';
+import { BusinessSettings, Category, PackageDefinition, Product, SellingTier, StockBatch, StockMovement, Supplier, Unit, User } from '../types';
 import { OfflineStorageManager } from '../utils/storage';
+import { formatStockWithCartons } from '../utils/tierAndTaxUtils';
 import { BarcodeScannerModal } from './BarcodeScannerModal';
 import { ProductPhotoCapture } from './ProductPhotoCapture';
 import { CategoryManagerModal } from './CategoryManagerModal';
+import { DistributorManagerModal } from './DistributorManagerModal';
 
 interface InventoryViewProps {
   settings: BusinessSettings;
   activeUser: User;
   onNavigateToIntake: () => void;
+  onNavigateToDistributors?: () => void;
+  onNavigateToPackages?: () => void;
   onRefresh: () => void;
 }
 
@@ -45,13 +51,18 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   settings,
   activeUser,
   onNavigateToIntake,
+  onNavigateToDistributors,
+  onNavigateToPackages,
   onRefresh,
 }) => {
   const [products, setProducts] = useState<Product[]>(() => OfflineStorageManager.getProducts());
   const [categories, setCategories] = useState<Category[]>(() => OfflineStorageManager.getCategories());
   const [units] = useState<Unit[]>(() => OfflineStorageManager.getUnits());
+  const [packageDefs, setPackageDefs] = useState<PackageDefinition[]>(() => OfflineStorageManager.getPackageDefinitions());
+  const [suppliers, setSuppliers] = useState<Supplier[]>(() => OfflineStorageManager.getSuppliers());
   const [movements, setMovements] = useState<StockMovement[]>(() => OfflineStorageManager.getMovements());
   const [batches, setBatches] = useState<StockBatch[]>(() => OfflineStorageManager.getBatches());
+  const [distributorModalOpen, setDistributorModalOpen] = useState(false);
 
   // Listen to background updates across tabs or views
   useEffect(() => {
@@ -60,6 +71,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       setCategories(OfflineStorageManager.getCategories());
       setMovements(OfflineStorageManager.getMovements());
       setBatches(OfflineStorageManager.getBatches());
+      setSuppliers(OfflineStorageManager.getSuppliers());
     };
     window.addEventListener('app-storage-updated', handleUpdate);
     return () => window.removeEventListener('app-storage-updated', handleUpdate);
@@ -94,8 +106,12 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   const [adjustedQty, setAdjustedQty] = useState<number>(0);
   const [adjustReason, setAdjustReason] = useState<string>('Physical count reconciliation');
 
-  // Scanner for lookup
+  // Scanner for lookup & form autofill
   const [scannerOpen, setScannerOpen] = useState(false);
+  const [scannerTarget, setScannerTarget] = useState<'lookup' | 'product_barcode'>('lookup');
+  const barcodeInputRef = useRef<HTMLInputElement | null>(null);
+  const skuInputRef = useRef<HTMLInputElement | null>(null);
+  const [barcodeFeedback, setBarcodeFeedback] = useState<string | null>(null);
 
   // Form states for Product create/edit
   const [formData, setFormData] = useState<{
@@ -116,6 +132,17 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
     trackBatches: boolean;
     imageUrl?: string;
     pricingCurrency: 'DUAL' | 'USD' | 'LRD';
+    hasPackageUnit: boolean;
+    packageUnitName: string;
+    packageMultiplier: number;
+    packagePriceLRD: number;
+    packagePriceUSD: number;
+    halfPackagePriceLRD?: number;
+    halfPackagePriceUSD?: number;
+    quarterPackagePriceLRD?: number;
+    quarterPackagePriceUSD?: number;
+    packageCostUSD: number;
+    taxStatus: 'TAXABLE' | 'ZERO_RATED' | 'EXEMPT';
   }>({
     name: '',
     sku: '',
@@ -134,10 +161,21 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
     trackBatches: true,
     imageUrl: undefined,
     pricingCurrency: 'DUAL',
+    hasPackageUnit: false,
+    packageUnitName: 'Pack of 12',
+    packageMultiplier: 12,
+    packagePriceLRD: 2200,
+    packagePriceUSD: 11.0,
+    halfPackagePriceLRD: 1100,
+    halfPackagePriceUSD: 5.5,
+    quarterPackagePriceLRD: 550,
+    quarterPackagePriceUSD: 2.75,
+    packageCostUSD: 8.5,
+    taxStatus: 'TAXABLE',
   });
 
-  const isAdmin = activeUser.role === 'owner' || activeUser.role === 'manager';
-  const canViewCostAndProfit = isAdmin;
+  const isAdmin = activeUser.role === 'owner' || activeUser.role === 'manager' || activeUser.canAdjustInventory;
+  const canViewCostAndProfit = activeUser.role === 'owner' || activeUser.role === 'manager' || activeUser.canViewCostProfit;
 
   const totalStockValueUSD = products.reduce((acc, p) => acc + p.currentStock * p.costPriceUSD, 0);
   const totalRetailValueUSD = products.reduce((acc, p) => acc + p.currentStock * p.sellingPriceUSD, 0);
@@ -173,6 +211,17 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       trackBatches: false,
       imageUrl: undefined,
       pricingCurrency: 'DUAL',
+      hasPackageUnit: false,
+      packageUnitName: 'Pack of 12',
+      packageMultiplier: 12,
+      packagePriceLRD: Math.round(defaultLRD * 12 * 0.9), // 10% bundle discount default
+      packagePriceUSD: Math.round(defaultUSD * 12 * 0.9 * 100) / 100,
+      halfPackagePriceLRD: Math.round(defaultLRD * 6 * 0.9),
+      halfPackagePriceUSD: Math.round(defaultUSD * 6 * 0.9 * 100) / 100,
+      quarterPackagePriceLRD: Math.round(defaultLRD * 3 * 0.9),
+      quarterPackagePriceUSD: Math.round(defaultUSD * 3 * 0.9 * 100) / 100,
+      packageCostUSD: Math.round(defaultCostUSD * 12 * 100) / 100,
+      taxStatus: 'TAXABLE',
     });
     setProductModalOpen(true);
   };
@@ -185,6 +234,12 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
     setEditingProduct(prod);
     const lrdPrice = prod.sellingPriceLRD || Math.round(prod.sellingPriceUSD * settings.exchangeRate);
     const costLRD = Math.round(prod.costPriceUSD * settings.exchangeRate);
+
+    const hasPkg = Boolean(prod.hasPackageUnit);
+    const multiplier = prod.packageMultiplier || 12;
+    const pkgLRD = prod.packagePriceLRD || Math.round((prod.packagePriceUSD || prod.sellingPriceUSD * multiplier * 0.9) * settings.exchangeRate);
+    const pkgUSD = prod.packagePriceUSD || Math.round((pkgLRD / settings.exchangeRate) * 100) / 100;
+    const pkgCostUSD = prod.packageCostUSD || Math.round(prod.costPriceUSD * multiplier * 100) / 100;
 
     setFormData({
       name: prod.name,
@@ -204,6 +259,19 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       trackBatches: prod.trackBatches,
       imageUrl: prod.imageUrl,
       pricingCurrency: prod.pricingCurrency || 'DUAL',
+      hasPackageUnit: hasPkg,
+      packageUnitName: prod.packageUnitName || 'Pack of 12',
+      packageMultiplier: multiplier,
+      packagePriceLRD: pkgLRD,
+      packagePriceUSD: pkgUSD,
+      halfPackagePriceLRD: prod.halfPackagePriceLRD || (prod.halfPackagePriceUSD ? Math.round(prod.halfPackagePriceUSD * settings.exchangeRate) : undefined),
+      halfPackagePriceUSD: prod.halfPackagePriceUSD,
+      threeQuarterPackagePriceLRD: prod.threeQuarterPackagePriceLRD || (prod.threeQuarterPackagePriceUSD ? Math.round(prod.threeQuarterPackagePriceUSD * settings.exchangeRate) : undefined),
+      threeQuarterPackagePriceUSD: prod.threeQuarterPackagePriceUSD,
+      quarterPackagePriceLRD: prod.quarterPackagePriceLRD || (prod.quarterPackagePriceUSD ? Math.round(prod.quarterPackagePriceUSD * settings.exchangeRate) : undefined),
+      quarterPackagePriceUSD: prod.quarterPackagePriceUSD,
+      packageCostUSD: pkgCostUSD,
+      taxStatus: prod.taxStatus || 'TAXABLE',
     });
     setProductModalOpen(true);
   };
@@ -257,6 +325,19 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
         trackBatches: Boolean(formData.trackBatches),
         imageUrl: formData.imageUrl,
         updatedAt: new Date().toISOString(),
+        hasPackageUnit: formData.hasPackageUnit,
+        packageUnitName: formData.packageUnitName.trim() || undefined,
+        packageMultiplier: formData.hasPackageUnit ? Number(formData.packageMultiplier) || 12 : undefined,
+        packagePriceLRD: formData.hasPackageUnit ? Number(formData.packagePriceLRD) || 0 : undefined,
+        packagePriceUSD: formData.hasPackageUnit ? Number(formData.packagePriceUSD) || 0 : undefined,
+        halfPackagePriceLRD: formData.hasPackageUnit && formData.halfPackagePriceLRD ? Number(formData.halfPackagePriceLRD) : undefined,
+        halfPackagePriceUSD: formData.hasPackageUnit && formData.halfPackagePriceUSD ? Number(formData.halfPackagePriceUSD) : undefined,
+        threeQuarterPackagePriceLRD: formData.hasPackageUnit && formData.threeQuarterPackagePriceLRD ? Number(formData.threeQuarterPackagePriceLRD) : undefined,
+        threeQuarterPackagePriceUSD: formData.hasPackageUnit && formData.threeQuarterPackagePriceUSD ? Number(formData.threeQuarterPackagePriceUSD) : undefined,
+        quarterPackagePriceLRD: formData.hasPackageUnit && formData.quarterPackagePriceLRD ? Number(formData.quarterPackagePriceLRD) : undefined,
+        quarterPackagePriceUSD: formData.hasPackageUnit && formData.quarterPackagePriceUSD ? Number(formData.quarterPackagePriceUSD) : undefined,
+        packageCostUSD: formData.hasPackageUnit ? Number(formData.packageCostUSD) || 0 : undefined,
+        taxStatus: formData.taxStatus || 'TAXABLE',
       };
       OfflineStorageManager.saveProduct(updated);
 
@@ -291,6 +372,19 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
         isActive: true,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        hasPackageUnit: formData.hasPackageUnit,
+        packageUnitName: formData.packageUnitName.trim() || undefined,
+        packageMultiplier: formData.hasPackageUnit ? Number(formData.packageMultiplier) || 12 : undefined,
+        packagePriceLRD: formData.hasPackageUnit ? Number(formData.packagePriceLRD) || 0 : undefined,
+        packagePriceUSD: formData.hasPackageUnit ? Number(formData.packagePriceUSD) || 0 : undefined,
+        halfPackagePriceLRD: formData.hasPackageUnit && formData.halfPackagePriceLRD ? Number(formData.halfPackagePriceLRD) : undefined,
+        halfPackagePriceUSD: formData.hasPackageUnit && formData.halfPackagePriceUSD ? Number(formData.halfPackagePriceUSD) : undefined,
+        threeQuarterPackagePriceLRD: formData.hasPackageUnit && formData.threeQuarterPackagePriceLRD ? Number(formData.threeQuarterPackagePriceLRD) : undefined,
+        threeQuarterPackagePriceUSD: formData.hasPackageUnit && formData.threeQuarterPackagePriceUSD ? Number(formData.threeQuarterPackagePriceUSD) : undefined,
+        quarterPackagePriceLRD: formData.hasPackageUnit && formData.quarterPackagePriceLRD ? Number(formData.quarterPackagePriceLRD) : undefined,
+        quarterPackagePriceUSD: formData.hasPackageUnit && formData.quarterPackagePriceUSD ? Number(formData.quarterPackagePriceUSD) : undefined,
+        packageCostUSD: formData.hasPackageUnit ? Number(formData.packageCostUSD) || 0 : undefined,
+        taxStatus: formData.taxStatus || 'TAXABLE',
       };
       OfflineStorageManager.saveProduct(newProd);
 
@@ -344,14 +438,12 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
 
   const handleConfirmDelete = () => {
     if (!deleteCandidate) return;
-    if (!isAdmin) {
-      alert('Permission Denied: Only Store Owner or Manager can delete products.');
-      return;
-    }
     OfflineStorageManager.deleteProduct(deleteCandidate.id, activeUser.name);
     setDeleteCandidate(null);
     setProductModalOpen(false);
-    setProducts(OfflineStorageManager.getProducts());
+    setEditingProduct(null);
+    const refreshed = OfflineStorageManager.getProducts();
+    setProducts(refreshed);
     onRefresh();
   };
 
@@ -439,6 +531,21 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
     'cat-4': 'border-t-rose-500',
     'cat-5': 'border-t-amber-500',
   };
+
+  // Duplicate item detection in new/edit item modal
+  const duplicateMatch = products.find((p) => {
+    if (editingProduct && p.id === editingProduct.id) return false;
+    const nameMatch = Boolean(
+      formData.name.trim().length >= 3 &&
+      p.name.trim().toLowerCase() === formData.name.trim().toLowerCase()
+    );
+    const barcodeMatch = Boolean(
+      formData.barcode.trim().length >= 3 &&
+      (p.barcode === formData.barcode.trim() ||
+        (p.alternativeBarcodes && p.alternativeBarcodes.includes(formData.barcode.trim())))
+    );
+    return nameMatch || barcodeMatch;
+  });
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-stone-100 text-stone-900">
@@ -656,8 +763,19 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="Search goods name, barcode, or SKU..."
-                  className="w-full bg-stone-50 border border-stone-300 rounded-xl pl-8 pr-3 py-1.5 text-xs text-stone-900 placeholder-stone-400 focus:outline-none focus:bg-white focus:border-stone-900"
+                  className="w-full bg-stone-50 border border-stone-300 rounded-xl pl-8 pr-8 py-1.5 text-xs text-stone-900 placeholder-stone-400 focus:outline-none focus:bg-white focus:border-stone-900"
                 />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setScannerTarget('lookup');
+                    setScannerOpen(true);
+                  }}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-stone-400 hover:text-stone-800 p-0.5 rounded transition"
+                  title="Scan barcode to lookup item"
+                >
+                  <Barcode className="w-4 h-4 text-blue-600" />
+                </button>
               </div>
 
               <select
@@ -769,6 +887,30 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
               <FolderPlus className="w-3.5 h-3.5 text-blue-600" />
               <span>+ Manage Categories</span>
             </button>
+
+            {/* "Manage Distributors" Button */}
+            <button
+              type="button"
+              onClick={() => setDistributorModalOpen(true)}
+              className="px-3 py-1 rounded-full font-bold whitespace-nowrap text-xs bg-amber-50 text-amber-800 hover:bg-amber-100 border border-amber-200 flex items-center gap-1 transition shrink-0"
+              title="Add or manage wholesale distributors and suppliers"
+            >
+              <Building2 className="w-3.5 h-3.5 text-amber-600" />
+              <span>Manage Distributors</span>
+            </button>
+
+            {/* "Package Definitions" Button */}
+            {onNavigateToPackages && (
+              <button
+                type="button"
+                onClick={onNavigateToPackages}
+                className="px-3 py-1 rounded-full font-bold whitespace-nowrap text-xs bg-stone-100 text-stone-700 hover:bg-stone-200 border border-stone-300 flex items-center gap-1 transition shrink-0"
+                title="Define package containers and conversion multipliers"
+              >
+                <Boxes className="w-3.5 h-3.5 text-amber-600" />
+                <span>Package Definitions</span>
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -829,7 +971,17 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                                       : 'bg-emerald-50 text-emerald-800 border-emerald-200'
                                   }`}
                                 >
-                                  {product.currentStock} {u?.symbol || 'pcs'}
+                                  {(() => {
+                                    const sb = formatStockWithCartons(
+                                      product.currentStock,
+                                      product.packageMultiplier,
+                                      product.packageUnitName,
+                                      u?.symbol || 'pcs'
+                                    );
+                                    return sb.breakdownFormatted
+                                      ? `${product.currentStock} ${u?.symbol || 'pcs'} (${sb.equivalentText})`
+                                      : `${product.currentStock} ${u?.symbol || 'pcs'}`;
+                                  })()}
                                 </span>
 
                                 {isOutOfStock ? (
@@ -859,25 +1011,46 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                             </div>
                           </div>
 
-                          {/* Dual Price Row */}
+                          {/* Pricing Display in Designated Currency */}
                           <div className="pt-2 border-t border-stone-100 flex items-baseline justify-between">
                             <div>
-                              <div className="font-black text-stone-900 font-mono text-sm sm:text-base flex items-center gap-1">
-                                <span>L$ {priceLRD.toLocaleString()}</span>
-                                {product.pricingCurrency === 'LRD' && (
-                                  <span className="text-[9px] font-black px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-900">
-                                    LRD Peg
-                                  </span>
-                                )}
-                                {product.pricingCurrency === 'USD' && (
-                                  <span className="text-[9px] font-black px-1.5 py-0.2 rounded bg-blue-100 text-blue-900">
-                                    USD Peg
-                                  </span>
-                                )}
-                              </div>
-                              <div className="text-[11px] text-stone-500 font-mono font-medium">
-                                ${product.sellingPriceUSD.toFixed(2)} USD
-                              </div>
+                              {product.pricingCurrency === 'USD' ? (
+                                <div>
+                                  <div className="font-black text-blue-900 font-mono text-sm sm:text-base flex items-center gap-1.5">
+                                    <span>${product.sellingPriceUSD.toFixed(2)} USD</span>
+                                    <span className="text-[9px] font-black px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 border border-blue-200">
+                                      USD Only
+                                    </span>
+                                  </div>
+                                  <div className="text-[10px] text-stone-500 font-mono font-medium mt-0.5">
+                                    ≈ L$ {priceLRD.toLocaleString()} LRD (at {settings.exchangeRate})
+                                  </div>
+                                </div>
+                              ) : product.pricingCurrency === 'LRD' ? (
+                                <div>
+                                  <div className="font-black text-emerald-900 font-mono text-sm sm:text-base flex items-center gap-1.5">
+                                    <span>L$ {priceLRD.toLocaleString()} LRD</span>
+                                    <span className="text-[9px] font-black px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-200">
+                                      LRD Only
+                                    </span>
+                                  </div>
+                                  <div className="text-[10px] text-stone-500 font-mono font-medium mt-0.5">
+                                    ≈ ${product.sellingPriceUSD.toFixed(2)} USD (at {settings.exchangeRate})
+                                  </div>
+                                </div>
+                              ) : (
+                                <div>
+                                  <div className="font-black text-stone-900 font-mono text-sm sm:text-base flex items-center gap-1.5">
+                                    <span>L$ {priceLRD.toLocaleString()}</span>
+                                    <span className="text-[9px] font-black px-1.5 py-0.5 rounded bg-stone-100 text-stone-700 border border-stone-200">
+                                      Dual
+                                    </span>
+                                  </div>
+                                  <div className="text-[11px] text-stone-500 font-mono font-medium mt-0.5">
+                                    ${product.sellingPriceUSD.toFixed(2)} USD
+                                  </div>
+                                </div>
+                              )}
                             </div>
 
                             {/* Cost valuation for Admin */}
@@ -943,8 +1116,9 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                         <th className="p-3">Category</th>
                         <th className="p-3">SKU & Barcode</th>
                         <th className="p-3 text-right">In Stock</th>
-                        <th className="p-3 text-right">Price (LRD)</th>
-                        <th className="p-3 text-right">Price (USD)</th>
+                        <th className="p-3 text-center">Pricing Currency</th>
+                        <th className="p-3 text-right">Selling Price</th>
+                        <th className="p-3 text-right">Equivalent Value</th>
                         <th className="p-3 text-center">Actions</th>
                       </tr>
                     </thead>
@@ -992,14 +1166,43 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                                     : 'bg-emerald-50 text-emerald-800'
                                 }`}
                               >
-                                {p.currentStock} {u?.symbol}
+                                {(() => {
+                                  const sb = formatStockWithCartons(
+                                    p.currentStock,
+                                    p.packageMultiplier,
+                                    p.packageUnitName,
+                                    u?.symbol || 'pcs'
+                                  );
+                                  return sb.breakdownFormatted
+                                    ? `${p.currentStock} ${u?.symbol || 'pcs'} (${sb.equivalentText})`
+                                    : `${p.currentStock} ${u?.symbol || 'pcs'}`;
+                                })()}
                               </span>
                             </td>
-                            <td className="p-3 text-right font-mono font-bold text-stone-900">
-                              L$ {priceLRD.toLocaleString()}
+                            <td className="p-3 text-center">
+                              {p.pricingCurrency === 'USD' ? (
+                                <span className="px-2 py-0.5 rounded text-[10px] font-black bg-blue-100 text-blue-900 border border-blue-200">
+                                  USD Only
+                                </span>
+                              ) : p.pricingCurrency === 'LRD' ? (
+                                <span className="px-2 py-0.5 rounded text-[10px] font-black bg-emerald-100 text-emerald-900 border border-emerald-200">
+                                  LRD Only
+                                </span>
+                              ) : (
+                                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-stone-100 text-stone-700 border border-stone-200">
+                                  Dual (USD/LRD)
+                                </span>
+                              )}
                             </td>
-                            <td className="p-3 text-right font-mono text-stone-600">
-                              ${p.sellingPriceUSD.toFixed(2)}
+                            <td className="p-3 text-right font-mono font-black text-stone-900">
+                              {p.pricingCurrency === 'USD'
+                                ? `$${p.sellingPriceUSD.toFixed(2)} USD`
+                                : `L$ ${priceLRD.toLocaleString()} LRD`}
+                            </td>
+                            <td className="p-3 text-right font-mono text-stone-500 text-[11px]">
+                              {p.pricingCurrency === 'USD'
+                                ? `≈ L$ ${priceLRD.toLocaleString()}`
+                                : `≈ $${p.sellingPriceUSD.toFixed(2)}`}
                             </td>
                             <td className="p-3 text-center">
                               {isAdmin && (
@@ -1240,6 +1443,59 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                 />
               </div>
 
+              {/* Duplicate Item Alert & Resolution Actions */}
+              {duplicateMatch && (
+                <div className="p-3 bg-amber-50 border-2 border-amber-400 rounded-xl space-y-2 text-xs text-amber-950 animate-in fade-in duration-200">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-extrabold text-amber-900">Duplicate Item Warning</span>
+                      <p className="text-[11px] text-amber-800 mt-0.5 leading-snug">
+                        An item named <strong>"{duplicateMatch.name}"</strong> (SKU: {duplicateMatch.sku}, Barcode: {duplicateMatch.barcode || 'None'}) already exists with <strong>{duplicateMatch.currentStock} in stock</strong>.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-amber-200">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFormData((prev) => ({
+                          ...prev,
+                          name: `${prev.name} (Variant 2)`,
+                        }));
+                      }}
+                      className="px-2.5 py-1 bg-white hover:bg-amber-100 text-amber-900 border border-amber-300 rounded-lg font-bold text-[10px] transition"
+                    >
+                      Auto-Rename as Variant
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProductModalOpen(false);
+                        handleOpenAdjust(duplicateMatch);
+                      }}
+                      className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-bold text-[10px] transition shadow-2xs"
+                    >
+                      Add Stock to Existing Item
+                    </button>
+
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDeleteCandidate(duplicateMatch);
+                        }}
+                        className="px-2.5 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-lg font-bold text-[10px] transition"
+                      >
+                        Delete Existing Duplicate
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* Quantity in Stock & Unit */}
               <div className="p-3 bg-blue-50/60 border border-blue-200 rounded-xl space-y-1.5">
                 <div className="flex items-center justify-between">
@@ -1301,115 +1557,117 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1">
                   <div className="flex items-center justify-between">
-                    <label className="text-stone-700 font-bold">Manufacturer Barcode</label>
+                    <label className="text-stone-700 dark:text-stone-300 font-bold flex items-center gap-1.5">
+                      <span>Manufacturer Barcode</span>
+                      {barcodeFeedback && (
+                        <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-black animate-fade-in">
+                          ✓ Autofilled
+                        </span>
+                      )}
+                    </label>
                     <button
                       type="button"
-                      onClick={() => setScannerOpen(true)}
-                      className="text-[10px] text-blue-600 hover:text-blue-700 font-bold flex items-center gap-1"
+                      onClick={() => {
+                        setScannerTarget('product_barcode');
+                        setScannerOpen(true);
+                      }}
+                      className="text-[10px] text-blue-600 dark:text-blue-400 hover:underline font-bold flex items-center gap-1"
                     >
                       <Camera className="w-3 h-3" />
                       <span>Scan Barcode</span>
                     </button>
                   </div>
                   <input
+                    ref={barcodeInputRef}
                     type="text"
                     value={formData.barcode}
                     onChange={(e) => setFormData({ ...formData, barcode: e.target.value })}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        skuInputRef.current?.focus();
+                        skuInputRef.current?.select();
+                      }
+                    }}
                     placeholder="e.g. 070001000123"
-                    className="w-full bg-stone-50 border border-stone-300 rounded-xl px-3 py-2 text-stone-900 font-mono focus:outline-none focus:bg-white focus:border-stone-900"
+                    className="w-full bg-stone-50 dark:bg-stone-850 border border-stone-300 dark:border-stone-700 rounded-xl px-3 py-2 text-stone-900 dark:text-stone-100 font-mono focus:outline-none focus:bg-white dark:focus:bg-stone-900 focus:border-stone-900 dark:focus:border-stone-500"
                   />
                 </div>
                 <div className="space-y-1">
-                  <label className="text-stone-700 font-bold">Internal SKU</label>
+                  <label className="text-stone-700 dark:text-stone-300 font-bold">Internal SKU</label>
                   <input
+                    ref={skuInputRef}
                     type="text"
                     value={formData.sku}
                     onChange={(e) => setFormData({ ...formData, sku: e.target.value })}
-                    className="w-full bg-stone-50 border border-stone-300 rounded-xl px-3 py-2 text-stone-900 font-mono focus:outline-none focus:bg-white focus:border-stone-900"
+                    className="w-full bg-stone-50 dark:bg-stone-850 border border-stone-300 dark:border-stone-700 rounded-xl px-3 py-2 text-stone-900 dark:text-stone-100 font-mono focus:outline-none focus:bg-white dark:focus:bg-stone-900 focus:border-stone-900 dark:focus:border-stone-500"
                   />
                 </div>
               </div>
 
-              {/* Pricing in Liberian Dollars (Primary) and USD */}
-              <div className="space-y-2 p-3 bg-stone-50 rounded-xl border border-stone-200">
+              {/* Pricing Currency and Price Configuration */}
+              <div className="space-y-3 p-3.5 bg-stone-50 rounded-xl border border-stone-200">
                 <div className="flex items-center justify-between">
-                  <span className="font-bold text-stone-800 text-xs">Selling Price & Currency Origin</span>
-                  <span className="text-[10px] text-stone-500 font-mono">
+                  <div>
+                    <span className="font-extrabold text-stone-900 text-xs">Pricing Currency & Master Price</span>
+                    <p className="text-[10px] text-stone-500">
+                      Flag items priced in USD only, LRD only, or standard dual currency.
+                    </p>
+                  </div>
+                  <span className="text-[10px] text-stone-500 font-mono bg-white px-2 py-0.5 rounded border border-stone-200 font-bold">
                     Rate: 1 USD = {settings.exchangeRate} LRD
                   </span>
                 </div>
 
-                {/* Currency Peg Toggle */}
+                {/* Currency Mode Selector */}
                 <div className="grid grid-cols-3 gap-1.5 p-1 bg-stone-200/80 rounded-xl text-[11px] font-bold">
                   <button
                     type="button"
-                    onClick={() => setFormData({ ...formData, pricingCurrency: 'DUAL' })}
-                    className={`py-1.5 px-2 rounded-lg text-center transition ${
-                      formData.pricingCurrency === 'DUAL'
-                        ? 'bg-white text-stone-900 shadow-xs font-black'
-                        : 'text-stone-600 hover:text-stone-900'
-                    }`}
-                  >
-                    Dual (Standard)
-                  </button>
-                  <button
-                    type="button"
                     onClick={() => setFormData({ ...formData, pricingCurrency: 'USD' })}
-                    className={`py-1.5 px-2 rounded-lg text-center transition ${
+                    className={`py-2 px-2 rounded-lg text-center transition flex flex-col items-center gap-0.5 ${
                       formData.pricingCurrency === 'USD'
                         ? 'bg-blue-600 text-white shadow-xs font-black'
                         : 'text-stone-600 hover:text-stone-900'
                     }`}
                   >
-                    Strictly USD ($)
+                    <span>USD ($) Only</span>
+                    <span className="text-[9px] opacity-80 font-normal">Fixed dollar price</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => setFormData({ ...formData, pricingCurrency: 'LRD' })}
-                    className={`py-1.5 px-2 rounded-lg text-center transition ${
+                    className={`py-2 px-2 rounded-lg text-center transition flex flex-col items-center gap-0.5 ${
                       formData.pricingCurrency === 'LRD'
                         ? 'bg-emerald-600 text-white shadow-xs font-black'
                         : 'text-stone-600 hover:text-stone-900'
                     }`}
                   >
-                    Strictly LRD (L$)
+                    <span>LRD (L$) Only</span>
+                    <span className="text-[9px] opacity-80 font-normal">Fixed Liberian $</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFormData({ ...formData, pricingCurrency: 'DUAL' })}
+                    className={`py-2 px-2 rounded-lg text-center transition flex flex-col items-center gap-0.5 ${
+                      formData.pricingCurrency === 'DUAL'
+                        ? 'bg-white text-stone-900 shadow-xs font-black'
+                        : 'text-stone-600 hover:text-stone-900'
+                    }`}
+                  >
+                    <span>Dual Currency</span>
+                    <span className="text-[9px] opacity-80 font-normal">Standard both</span>
                   </button>
                 </div>
 
+                {/* Dynamic Inputs depending on Pricing Currency */}
                 <div className="grid grid-cols-2 gap-3 pt-1">
-                  <div className="space-y-1">
-                    <label className="text-stone-700 font-bold flex items-center justify-between">
-                      <span>Price in L$ LRD *</span>
-                      {formData.pricingCurrency === 'LRD' && (
-                        <span className="text-[9px] font-bold text-emerald-700 bg-emerald-100 px-1.5 py-0.2 rounded">
-                          Master Currency
-                        </span>
-                      )}
-                    </label>
-                    <div className="relative">
-                      <span className="absolute left-3 top-1/2 -translate-y-1/2 font-bold text-stone-400">L$</span>
-                      <input
-                        type="number"
-                        step="1"
-                        min="0"
-                        required
-                        value={formData.sellingPriceLRD}
-                        onChange={(e) => {
-                          const lrd = parseFloat(e.target.value) || 0;
-                          const usd = Math.round((lrd / settings.exchangeRate) * 100) / 100;
-                          setFormData({ ...formData, sellingPriceLRD: lrd, sellingPriceUSD: usd });
-                        }}
-                        className="w-full bg-white border border-stone-300 rounded-xl pl-8 pr-3 py-2 text-stone-900 font-mono text-sm font-black focus:outline-none focus:border-stone-900"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="space-y-1">
-                    <label className="text-stone-700 font-bold flex items-center justify-between">
-                      <span>Price in $ USD</span>
+                  {/* USD Price Input */}
+                  <div className={`space-y-1 ${formData.pricingCurrency === 'USD' ? 'ring-2 ring-blue-500/50 rounded-xl p-1.5 bg-blue-50/40' : ''}`}>
+                    <label className="text-stone-700 font-bold flex items-center justify-between text-xs">
+                      <span>Price in USD ($) {formData.pricingCurrency === 'USD' && '*'}</span>
                       {formData.pricingCurrency === 'USD' && (
-                        <span className="text-[9px] font-bold text-blue-700 bg-blue-100 px-1.5 py-0.2 rounded">
-                          Master Currency
+                        <span className="text-[9px] font-black text-blue-700 bg-blue-100 px-1.5 py-0.5 rounded border border-blue-200">
+                          Designated Currency
                         </span>
                       )}
                     </label>
@@ -1419,15 +1677,56 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                         type="number"
                         step="0.01"
                         min="0"
+                        required={formData.pricingCurrency === 'USD'}
                         value={formData.sellingPriceUSD}
                         onChange={(e) => {
                           const usd = parseFloat(e.target.value) || 0;
                           const lrd = Math.round(usd * settings.exchangeRate);
                           setFormData({ ...formData, sellingPriceUSD: usd, sellingPriceLRD: lrd });
                         }}
-                        className="w-full bg-white border border-stone-300 rounded-xl pl-7 pr-3 py-2 text-stone-900 font-mono text-sm focus:outline-none focus:border-stone-900"
+                        placeholder="0.00"
+                        className="w-full bg-white border border-stone-300 rounded-xl pl-7 pr-3 py-2 text-stone-900 font-mono text-sm font-black focus:outline-none focus:border-stone-900"
                       />
                     </div>
+                    {formData.pricingCurrency === 'USD' && (
+                      <p className="text-[10px] text-stone-500">
+                        Autoconverts to L$ {Math.round(formData.sellingPriceUSD * settings.exchangeRate).toLocaleString()} LRD for walk-in cash payments.
+                      </p>
+                    )}
+                  </div>
+
+                  {/* LRD Price Input */}
+                  <div className={`space-y-1 ${formData.pricingCurrency === 'LRD' ? 'ring-2 ring-emerald-500/50 rounded-xl p-1.5 bg-emerald-50/40' : ''}`}>
+                    <label className="text-stone-700 font-bold flex items-center justify-between text-xs">
+                      <span>Price in LRD (L$) {formData.pricingCurrency === 'LRD' && '*'}</span>
+                      {formData.pricingCurrency === 'LRD' && (
+                        <span className="text-[9px] font-black text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded border border-emerald-200">
+                          Designated Currency
+                        </span>
+                      )}
+                    </label>
+                    <div className="relative">
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 font-bold text-stone-400">L$</span>
+                      <input
+                        type="number"
+                        step="1"
+                        min="0"
+                        required={formData.pricingCurrency === 'LRD' || formData.pricingCurrency === 'DUAL'}
+                        value={formData.sellingPriceLRD}
+                        onChange={(e) => {
+                          const lrd = parseFloat(e.target.value) || 0;
+                          const usd = Math.round((lrd / settings.exchangeRate) * 100) / 100;
+                          setFormData({ ...formData, sellingPriceLRD: lrd, sellingPriceUSD: usd });
+                        }}
+                        placeholder="0"
+                        className="w-full bg-white border border-stone-300 rounded-xl pl-8 pr-3 py-2 text-stone-900 font-mono text-sm font-black focus:outline-none focus:border-stone-900"
+                      />
+                    </div>
+                    {formData.pricingCurrency === 'LRD' && (
+                      <p className="text-[10px] text-stone-500">
+                        Autoconverts to ${(formData.sellingPriceLRD / settings.exchangeRate).toFixed(2)} USD for dollar cash payments.
+                      </p>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1481,8 +1780,8 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                 </div>
               )}
 
-              {/* Category (With inline "+ New Category" button) & Reorder level */}
-              <div className="grid grid-cols-2 gap-3">
+              {/* Category & Tax Status & Reorder level */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div className="space-y-1">
                   <div className="flex items-center justify-between">
                     <label className="text-stone-700 font-bold">Category *</label>
@@ -1509,7 +1808,20 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                 </div>
 
                 <div className="space-y-1">
-                  <label className="text-stone-700 font-bold">Low Stock Warning Level</label>
+                  <label className="text-stone-700 font-bold">Tax Regime Status</label>
+                  <select
+                    value={formData.taxStatus || 'TAXABLE'}
+                    onChange={(e) => setFormData({ ...formData, taxStatus: e.target.value as any })}
+                    className="w-full bg-stone-50 border border-stone-300 rounded-xl px-3 py-2 text-stone-900 font-bold text-xs focus:outline-none focus:bg-white focus:border-stone-900"
+                  >
+                    <option value="TAXABLE">Standard Taxable ({settings.taxName || 'GST'} Applies)</option>
+                    <option value="ZERO_RATED">Zero-Rated (0% GST Basic Commodity)</option>
+                    <option value="EXEMPT">Tax-Exempt (No Tax Relief)</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-stone-700 font-bold">Low Stock Warning</label>
                   <input
                     type="number"
                     value={formData.minStockLevel}
@@ -1519,6 +1831,323 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                     className="w-full bg-stone-50 border border-stone-300 rounded-xl px-3 py-2 text-stone-900 font-mono focus:outline-none focus:bg-white focus:border-stone-900"
                   />
                 </div>
+              </div>
+
+              {/* Wholesale Packaging Configuration Section (No Toggle - Explicit Segmented Mode) */}
+              <div className="p-3.5 bg-amber-50/70 border-2 border-amber-300 rounded-2xl space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-lg bg-amber-200/80 text-amber-900 flex items-center justify-center">
+                      <Boxes className="w-4 h-4 text-amber-800" />
+                    </div>
+                    <div>
+                      <span className="font-extrabold text-stone-900 text-xs">
+                        Wholesale & Bulk Package Setup
+                      </span>
+                      <p className="text-[10px] text-stone-500">
+                        Does this item also sell in bulk packs, cartons, crates, or boxes?
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Sales Mode Selector: Clear segmented choice like currency mode */}
+                <div className="grid grid-cols-2 gap-2 p-1 bg-amber-100/60 rounded-xl text-xs font-bold">
+                  <button
+                    type="button"
+                    onClick={() => setFormData({ ...formData, hasPackageUnit: false })}
+                    className={`py-2 px-3 rounded-lg text-center transition flex items-center justify-center gap-1.5 ${
+                      !formData.hasPackageUnit
+                        ? 'bg-white text-stone-900 shadow-xs font-black'
+                        : 'text-stone-600 hover:text-stone-900'
+                    }`}
+                  >
+                    <span>🏷️ Retail Loose Units Only</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setFormData({
+                        ...formData,
+                        hasPackageUnit: true,
+                        packageUnitName: formData.packageUnitName || 'Pack of 12 (Dozen)',
+                        packageMultiplier: formData.packageMultiplier || 12,
+                        packagePriceLRD:
+                          formData.packagePriceLRD || Math.round(formData.sellingPriceLRD * 12 * 0.9),
+                        packagePriceUSD:
+                          formData.packagePriceUSD ||
+                          Math.round(formData.sellingPriceUSD * 12 * 0.9 * 100) / 100,
+                      })
+                    }
+                    className={`py-2 px-3 rounded-lg text-center transition flex items-center justify-center gap-1.5 ${
+                      formData.hasPackageUnit
+                        ? 'bg-amber-600 text-white shadow-xs font-black'
+                        : 'text-stone-600 hover:text-stone-900'
+                    }`}
+                  >
+                    <Boxes className="w-3.5 h-3.5" />
+                    <span>📦 Dual: Wholesale + Retail</span>
+                  </button>
+                </div>
+
+                {formData.hasPackageUnit ? (
+                  <div className="space-y-3 pt-2 border-t border-amber-200/80 animate-in fade-in duration-200">
+                    {/* Quick Preset Selector from defined Package Definitions */}
+                    {packageDefs.length > 0 && (
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-bold text-amber-900 uppercase tracking-wider">
+                          Choose From Package Presets:
+                        </label>
+                        <div className="flex flex-wrap gap-1.5">
+                          {packageDefs.map((pkg) => (
+                            <button
+                              key={pkg.id}
+                              type="button"
+                              onClick={() => {
+                                const mult = pkg.multiplier;
+                                const lrd = Math.round(formData.sellingPriceLRD * mult * 0.9);
+                                const usd = Math.round(formData.sellingPriceUSD * mult * 0.9 * 100) / 100;
+                                const costUSD = Math.round(formData.costPriceUSD * mult * 100) / 100;
+                                setFormData({
+                                  ...formData,
+                                  packageUnitName: pkg.name,
+                                  packageMultiplier: mult,
+                                  packagePriceLRD: lrd,
+                                  packagePriceUSD: usd,
+                                  packageCostUSD: costUSD,
+                                });
+                              }}
+                              className={`px-2.5 py-1 rounded-lg text-xs font-bold border transition ${
+                                formData.packageMultiplier === pkg.multiplier && formData.packageUnitName === pkg.name
+                                  ? 'bg-amber-600 text-white border-amber-700 shadow-2xs'
+                                  : 'bg-white text-stone-700 border-amber-200 hover:bg-amber-100/70'
+                              }`}
+                            >
+                              {pkg.name} (&times;{pkg.multiplier})
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="space-y-1">
+                        <label className="text-stone-700 font-bold">Package Name *</label>
+                        <input
+                          type="text"
+                          required={formData.hasPackageUnit}
+                          placeholder="e.g. Pack of 12, Crate of 24"
+                          value={formData.packageUnitName}
+                          onChange={(e) => setFormData({ ...formData, packageUnitName: e.target.value })}
+                          className="w-full bg-white border border-stone-300 rounded-xl px-3 py-1.5 text-stone-900 focus:outline-none focus:border-amber-600 font-medium"
+                        />
+                      </div>
+
+                      <div className="space-y-1">
+                        <label className="text-stone-700 font-bold">
+                          Units in 1 Package (Multiplier) *
+                        </label>
+                        <div className="relative">
+                          <input
+                            type="number"
+                            min="1"
+                            step="1"
+                            required={formData.hasPackageUnit}
+                            value={formData.packageMultiplier}
+                            onChange={(e) => {
+                              const mult = parseInt(e.target.value) || 1;
+                              const lrd = Math.round(formData.sellingPriceLRD * mult * 0.9);
+                              const usd = Math.round(formData.sellingPriceUSD * mult * 0.9 * 100) / 100;
+                              const costUSD = Math.round(formData.costPriceUSD * mult * 100) / 100;
+                              setFormData({
+                                ...formData,
+                                packageMultiplier: mult,
+                                packagePriceLRD: lrd,
+                                packagePriceUSD: usd,
+                                packageCostUSD: costUSD,
+                              });
+                            }}
+                            className="w-full bg-white border border-stone-300 rounded-xl px-3 py-1.5 text-stone-900 font-mono font-bold focus:outline-none focus:border-amber-600"
+                          />
+                          <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-stone-400 font-semibold">
+                            units/pk
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Wholesale Selling Price Boxes (Side-by-Side) */}
+                    <div className="grid grid-cols-2 gap-3 p-2.5 bg-white rounded-xl border border-amber-200">
+                      <div className="space-y-1">
+                        <label className="text-stone-700 font-bold flex items-center justify-between">
+                          <span>Wholesale Selling Price (L$)</span>
+                          <span className="text-[10px] text-emerald-700 font-bold">Per {formData.packageUnitName || 'Pack'}</span>
+                        </label>
+                        <div className="relative">
+                          <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-stone-400 font-bold">L$</span>
+                          <input
+                            type="number"
+                            min="0"
+                            step="1"
+                            value={formData.packagePriceLRD}
+                            onChange={(e) => {
+                              const lrd = parseFloat(e.target.value) || 0;
+                              const usd = Math.round((lrd / settings.exchangeRate) * 100) / 100;
+                              setFormData({ ...formData, packagePriceLRD: lrd, packagePriceUSD: usd });
+                            }}
+                            className="w-full bg-stone-50 border border-stone-300 rounded-lg pl-8 pr-2.5 py-1.5 text-stone-900 font-mono font-bold focus:outline-none focus:border-amber-600"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <label className="text-stone-700 font-bold flex items-center justify-between">
+                          <span>Wholesale Selling Price ($)</span>
+                          <span className="text-[10px] text-blue-700 font-bold">Per {formData.packageUnitName || 'Pack'}</span>
+                        </label>
+                        <div className="relative">
+                          <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-stone-400 font-bold">$</span>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={formData.packagePriceUSD}
+                            onChange={(e) => {
+                              const usd = parseFloat(e.target.value) || 0;
+                              const lrd = Math.round(usd * settings.exchangeRate);
+                              setFormData({ ...formData, packagePriceUSD: usd, packagePriceLRD: lrd });
+                            }}
+                            className="w-full bg-stone-50 border border-stone-300 rounded-lg pl-7 pr-2.5 py-1.5 text-stone-900 font-mono font-bold focus:outline-none focus:border-amber-600"
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Fractional Carton Selling Price Breakdown: Three-Quarter, Half, and Quarter */}
+                    <div className="space-y-2 p-2.5 bg-amber-100/50 rounded-xl border border-amber-200">
+                      <div className="flex items-center justify-between text-[11px] font-bold text-amber-950">
+                        <span>Fractional Carton / Package Tier Prices</span>
+                        <span className="text-[10px] text-stone-500 font-normal">Auto-proportional or custom override</span>
+                      </div>
+
+                      {/* Three-Quarter Carton (3/4) */}
+                      <div className="grid grid-cols-2 gap-3 p-2 bg-white rounded-lg border border-amber-200">
+                        <div className="space-y-0.5">
+                          <label className="text-[10px] font-bold text-stone-700">¾ Carton (3/4) L$</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="1"
+                            value={formData.threeQuarterPackagePriceLRD ?? ''}
+                            placeholder={String(Math.round(((formData.packagePriceLRD || 0) * 0.75)))}
+                            onChange={(e) => {
+                              const lrd = parseFloat(e.target.value) || 0;
+                              const usd = Math.round((lrd / settings.exchangeRate) * 100) / 100;
+                              setFormData({ ...formData, threeQuarterPackagePriceLRD: lrd, threeQuarterPackagePriceUSD: usd });
+                            }}
+                            className="w-full bg-stone-50 border border-stone-300 rounded px-2 py-1 text-xs font-mono font-bold"
+                          />
+                        </div>
+                        <div className="space-y-0.5">
+                          <label className="text-[10px] font-bold text-stone-700">¾ Carton (3/4) $</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={formData.threeQuarterPackagePriceUSD ?? ''}
+                            placeholder={String(Math.round(((formData.packagePriceUSD || 0) * 0.75) * 100) / 100)}
+                            onChange={(e) => {
+                              const usd = parseFloat(e.target.value) || 0;
+                              const lrd = Math.round(usd * settings.exchangeRate);
+                              setFormData({ ...formData, threeQuarterPackagePriceUSD: usd, threeQuarterPackagePriceLRD: lrd });
+                            }}
+                            className="w-full bg-stone-50 border border-stone-300 rounded px-2 py-1 text-xs font-mono font-bold"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Half Carton */}
+                      <div className="grid grid-cols-2 gap-3 p-2 bg-white rounded-lg border border-amber-200">
+                        <div className="space-y-0.5">
+                          <label className="text-[10px] font-bold text-stone-700">Half Carton (1/2) L$</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="1"
+                            value={formData.halfPackagePriceLRD ?? ''}
+                            placeholder={String(Math.round((formData.packagePriceLRD || 0) / 2))}
+                            onChange={(e) => {
+                              const lrd = parseFloat(e.target.value) || 0;
+                              const usd = Math.round((lrd / settings.exchangeRate) * 100) / 100;
+                              setFormData({ ...formData, halfPackagePriceLRD: lrd, halfPackagePriceUSD: usd });
+                            }}
+                            className="w-full bg-stone-50 border border-stone-300 rounded px-2 py-1 text-xs font-mono font-bold"
+                          />
+                        </div>
+                        <div className="space-y-0.5">
+                          <label className="text-[10px] font-bold text-stone-700">Half Carton (1/2) $</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={formData.halfPackagePriceUSD ?? ''}
+                            placeholder={String(Math.round(((formData.packagePriceUSD || 0) / 2) * 100) / 100)}
+                            onChange={(e) => {
+                              const usd = parseFloat(e.target.value) || 0;
+                              const lrd = Math.round(usd * settings.exchangeRate);
+                              setFormData({ ...formData, halfPackagePriceUSD: usd, halfPackagePriceLRD: lrd });
+                            }}
+                            className="w-full bg-stone-50 border border-stone-300 rounded px-2 py-1 text-xs font-mono font-bold"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Quarter Carton */}
+                      <div className="grid grid-cols-2 gap-3 p-2 bg-white rounded-lg border border-amber-200">
+                        <div className="space-y-0.5">
+                          <label className="text-[10px] font-bold text-stone-700">Quarter Carton (1/4) L$</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="1"
+                            value={formData.quarterPackagePriceLRD ?? ''}
+                            placeholder={String(Math.round((formData.packagePriceLRD || 0) / 4))}
+                            onChange={(e) => {
+                              const lrd = parseFloat(e.target.value) || 0;
+                              const usd = Math.round((lrd / settings.exchangeRate) * 100) / 100;
+                              setFormData({ ...formData, quarterPackagePriceLRD: lrd, quarterPackagePriceUSD: usd });
+                            }}
+                            className="w-full bg-stone-50 border border-stone-300 rounded px-2 py-1 text-xs font-mono font-bold"
+                          />
+                        </div>
+                        <div className="space-y-0.5">
+                          <label className="text-[10px] font-bold text-stone-700">Quarter Carton (1/4) $</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={formData.quarterPackagePriceUSD ?? ''}
+                            placeholder={String(Math.round(((formData.packagePriceUSD || 0) / 4) * 100) / 100)}
+                            onChange={(e) => {
+                              const usd = parseFloat(e.target.value) || 0;
+                              const lrd = Math.round(usd * settings.exchangeRate);
+                              setFormData({ ...formData, quarterPackagePriceUSD: usd, quarterPackagePriceLRD: lrd });
+                            }}
+                            className="w-full bg-stone-50 border border-stone-300 rounded px-2 py-1 text-xs font-mono font-bold"
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="text-[11px] text-stone-600 font-medium bg-white p-2.5 rounded-xl border border-amber-200">
+                      💡 <strong>Pricing & Stock Rule:</strong> Retail is L$ {formData.sellingPriceLRD} / bottle ({formData.packageMultiplier || 12} loose bottles = L$ {(formData.sellingPriceLRD || 0) * (formData.packageMultiplier || 12)}). Selling this wholesale pack at <strong>L$ {formData.packagePriceLRD}</strong> automatically deducts <strong>{formData.packageMultiplier || 12} single units</strong> from on-shelf inventory stock with zero discrepancy.
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-[11px] text-stone-500 bg-white p-2.5 rounded-xl border border-stone-200">
+                    ℹ️ Item will sell as <strong>Retail Single units only</strong>. Click "Dual: Wholesale + Retail" above to configure bulk packages (cartons, packs, boxes).
+                  </div>
+                )}
               </div>
 
               {/* Modal footer buttons */}
@@ -1653,19 +2282,34 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
         </div>
       )}
 
-      {/* Barcode Scanner Modal for Quick Item Lookup */}
+      {/* Barcode Scanner Modal for Item Lookup or Product Form Autofill */}
       <BarcodeScannerModal
         isOpen={scannerOpen}
         onClose={() => setScannerOpen(false)}
-        onDetected={(code) => {
+        initialValue={scannerTarget === 'product_barcode' ? formData.barcode : searchQuery}
+        onScan={(code) => {
           setScannerOpen(false);
-          const existing = products.find(
-            (p) => p.barcode === code || (p.alternativeBarcodes && p.alternativeBarcodes.includes(code))
-          );
-          if (existing) {
-            handleOpenEditProduct(existing);
+          const clean = code.trim();
+          if (scannerTarget === 'product_barcode') {
+            setFormData((prev) => ({ ...prev, barcode: clean }));
+            setBarcodeFeedback(`Autofilled: ${clean}`);
+            setTimeout(() => setBarcodeFeedback(null), 3500);
+            setTimeout(() => {
+              if (barcodeInputRef.current) {
+                barcodeInputRef.current.focus();
+                barcodeInputRef.current.select();
+              }
+            }, 120);
           } else {
-            handleOpenNewProduct(code);
+            setSearchQuery(clean);
+            const existing = products.find(
+              (p) => p.barcode === clean || (p.alternativeBarcodes && p.alternativeBarcodes.includes(clean))
+            );
+            if (existing) {
+              handleOpenEditProduct(existing);
+            } else {
+              handleOpenNewProduct(clean);
+            }
           }
         }}
       />
@@ -1680,6 +2324,21 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
         onCategorySelected={(newCatId) => {
           setSelectedCategory(newCatId);
           setFormData((prev) => ({ ...prev, categoryId: newCatId }));
+        }}
+      />
+
+      {/* Distributor Manager Modal */}
+      <DistributorManagerModal
+        isOpen={distributorModalOpen}
+        onClose={() => setDistributorModalOpen(false)}
+        suppliers={suppliers}
+        onSuppliersUpdated={() => {
+          setSuppliers(OfflineStorageManager.getSuppliers());
+          onRefresh();
+        }}
+        onNavigateToIntakeWithSupplier={(supId) => {
+          setDistributorModalOpen(false);
+          onNavigateToIntake();
         }}
       />
     </div>

@@ -9,15 +9,25 @@ export interface BusinessSettings {
   secondaryCurrency: 'USD' | 'LRD';
   exchangeRate: number; // e.g., 1 USD = 195 LRD
   lastExchangeRateReviewDate?: string; // e.g., "2026-09-18"
+  exchangeRateLastConfirmedDate?: string;
   taxEnabled: boolean;
-  taxRatePercent: number;
+  taxName?: string; // e.g. "GST", "VAT", "Sales Tax" - configurable, defaults to "GST"
+  taxRatePercent: number; // e.g. 10
+  taxCalculationType?: 'EXCLUSIVE' | 'INCLUSIVE'; // defaults to 'EXCLUSIVE'
+  storeTIN?: string; // Business / Store Tax Identification Number
   receiptHeader: string;
   receiptFooter: string;
   lowStockThresholdDefault: number;
   defaultThermalPaperSize: '58mm' | '80mm';
+  darkMode?: boolean;
+  updatedAt?: string;
+  trialExpiresAt?: string; // ISO timestamp when the 30-day evaluation ends
+  trialStartedAt?: string; // ISO timestamp when the trial started
+  licenseStatus?: 'TRIAL' | 'ACTIVE' | 'EXPIRED' | 'LIFETIME';
+  licensedTo?: string; // Name of the store or client
 }
 
-export type UserRole = 'owner' | 'manager' | 'cashier';
+export type UserRole = 'superadmin' | 'owner' | 'manager' | 'cashier';
 export type AppModuleId = 'pos' | 'inventory' | 'orders' | 'reports' | 'settings';
 
 export interface User {
@@ -30,6 +40,7 @@ export interface User {
   isActive: boolean;
   pin?: string;
   createdAt: string;
+  trialExpiresAt?: string; // Optional trial expiration date
   allowedModules?: AppModuleId[];
   canApplyDiscount?: boolean;
   canProcessRefund?: boolean;
@@ -72,6 +83,26 @@ export interface Unit {
   allowFractions: boolean;
 }
 
+export interface PackageDefinition {
+  id: string;
+  name: string; // e.g. "Pack", "Carton", "Dozen", "Crate", "Box", "Bundle"
+  multiplier: number; // e.g. 12 for Dozen, 24 for Crate, 50 for Box
+  description?: string;
+  isDefault?: boolean;
+}
+
+export type SellingTier = 'FULL' | 'THREE_QUARTERS' | 'HALF' | 'QUARTER' | 'PIECE';
+
+export interface ProductPackageTier {
+  id: string;
+  name: string; // e.g. "Pack of 6", "Carton of 12", "Box of 24"
+  multiplier: number; // e.g. 6, 12, 24 base units
+  barcode?: string; // unique package barcode
+  packagePriceUSD?: number; // wholesale selling price in USD
+  packagePriceLRD?: number; // wholesale selling price in LRD
+  packageCostUSD?: number; // wholesale cost per pack
+}
+
 export interface Product {
   id: string;
   sku: string;
@@ -84,8 +115,9 @@ export interface Product {
   unitId: string;
   sellingPriceUSD: number;
   sellingPriceLRD: number;
-  pricingCurrency?: 'USD' | 'LRD' | 'DUAL'; // Currency origin (USD-only, LRD-only, or Dual)
+  pricingCurrency?: 'USD' | 'LRD' | 'DUAL'; // 'USD' for USD-only, 'LRD' for LRD-only, 'DUAL' for both
   costPriceUSD: number; // restricted for regular cashier
+  costPriceLRD?: number;
   minStockLevel: number;
   targetStockLevel: number;
   currentStock: number;
@@ -94,6 +126,28 @@ export interface Product {
   isActive: boolean;
   createdAt: string;
   updatedAt: string;
+  // Wholesale & Bulk Package Configuration (Primary package definition)
+  hasPackageUnit?: boolean;
+  packageUnitName?: string; // e.g., 'Pack of 12', 'Carton', 'Crate'
+  packageMultiplier?: number; // e.g., 24 (1 carton = 24 bottles)
+  packageBarcode?: string; // Outer carton barcode if available
+  packagePriceUSD?: number; // Wholesale selling price in USD
+  packagePriceLRD?: number; // Wholesale selling price in LRD
+  packageCostUSD?: number; // Cost per pack from distributor
+
+  // Fractional Package Selling Tiers (Manual price overrides)
+  threeQuarterPackagePriceUSD?: number;
+  threeQuarterPackagePriceLRD?: number;
+  halfPackagePriceUSD?: number;
+  halfPackagePriceLRD?: number;
+  quarterPackagePriceUSD?: number;
+  quarterPackagePriceLRD?: number;
+
+  // Flexible Multi-Package Tiers (Support for multiple packaging sizes e.g. Pack of 6, Carton of 12, Box of 24)
+  packageTiers?: ProductPackageTier[];
+
+  // Tax Classification
+  taxStatus?: 'TAXABLE' | 'ZERO_RATED' | 'EXEMPT'; // Defaults to 'TAXABLE'
 }
 
 export interface StockBatch {
@@ -133,13 +187,19 @@ export interface StockMovement {
 export interface StockIntakeItem {
   productId: string;
   productName: string;
-  quantity: number;
-  unitCostUSD: number;
+  quantity: number; // total base units received into inventory
+  unitCostUSD: number; // cost per single base unit
   sellingPriceUSD: number;
   sellingPriceLRD: number;
   batchNumber?: string;
   expiryDate?: string;
   subtotalCostUSD: number;
+  // Package purchasing metadata
+  isPackagePurchase?: boolean;
+  packageUnitName?: string; // e.g. 'Carton'
+  packageMultiplier?: number; // e.g. 12
+  packagesCount?: number; // e.g. 10
+  costPerPackageUSD?: number; // e.g. $24.00
 }
 
 export interface StockIntakeTransaction {
@@ -164,6 +224,8 @@ export interface Customer {
   creditLimitUSD: number;
   currentDebtUSD: number;
   currentDebtLRD: number;
+  tin?: string; // Customer Tax Identification Number
+  taxExempt?: boolean; // Customer-level tax exemption flag (e.g. diplomatic / NGO)
   createdAt: string;
 }
 
@@ -187,16 +249,23 @@ export interface Supplier {
   email?: string;
   address?: string;
   notes?: string;
+  tin?: string; // Supplier Tax Identification Number
 }
 
 export interface CartItem {
   product: Product;
   quantity: number;
+  saleMode: 'RETAIL' | 'WHOLESALE'; // 'RETAIL' = single individual unit, 'WHOLESALE' = defined package unit or tier
+  sellingTier?: SellingTier; // 'FULL' | 'HALF' | 'QUARTER' | 'PIECE'
+  tierLabel?: string; // e.g. 'Full Carton (24 pcs)', 'Half Carton (12 pcs)'
+  unitLabel: string; // e.g. 'Bottle', 'Carton (24 pcs)', 'Half Carton (12 pcs)'
+  baseUnitQuantity: number; // multiplier: 1 for retail/piece, 12 for half, 24 for full
   unitPriceUSD: number;
   unitPriceLRD: number;
   discountUSD: number;
   totalUSD: number;
   totalLRD: number;
+  taxStatus?: 'TAXABLE' | 'ZERO_RATED' | 'EXEMPT';
 }
 
 export type PaymentMethod = 'CASH_USD' | 'CASH_LRD' | 'SPLIT_CASH' | 'MOBILE_MONEY' | 'CREDIT';
@@ -212,6 +281,22 @@ export interface SalePayment {
   reference?: string;
 }
 
+export interface TaxSnapshot {
+  taxEnabled: boolean;
+  taxName?: string;
+  taxRatePercent?: number;
+  taxCalculationType?: 'EXCLUSIVE' | 'INCLUSIVE';
+  storeTIN?: string;
+  customerTIN?: string;
+  customerTaxExemptApplied?: boolean;
+  taxableAmountUSD?: number;
+  taxableAmountLRD?: number;
+  exemptAmountUSD?: number;
+  zeroRatedAmountUSD?: number;
+  taxUSD?: number;
+  taxLRD?: number;
+}
+
 export interface Sale {
   id: string;
   receiptNumber: string;
@@ -225,18 +310,44 @@ export interface Sale {
     barcode: string;
     quantity: number;
     unitSymbol: string;
+    saleMode?: 'RETAIL' | 'WHOLESALE';
+    sellingTier?: SellingTier;
+    tierLabel?: string;
+    unitLabel?: string;
+    baseUnitQuantity?: number; // total single base units deducted = quantity * baseUnitQuantity
     unitPriceUSD: number;
     unitPriceLRD: number;
     unitCostUSD: number;
     totalUSD: number;
     totalLRD: number;
+    taxStatus?: 'TAXABLE' | 'ZERO_RATED' | 'EXEMPT';
+    taxUSD?: number;
+    taxLRD?: number;
   }[];
   subtotalUSD: number;
   subtotalLRD: number;
   discountUSD: number;
   taxUSD: number;
+  taxLRD?: number;
   totalUSD: number;
   totalLRD: number;
+  // Tax Snapshot & Compliance Metadata
+  taxSnapshot?: TaxSnapshot;
+  taxName?: string;
+  taxRatePercent?: number;
+  taxCalculationType?: 'EXCLUSIVE' | 'INCLUSIVE';
+  storeTIN?: string;
+  customerTIN?: string;
+  taxableAmountUSD?: number;
+  taxableAmountLRD?: number;
+  exemptAmountUSD?: number;
+  zeroRatedAmountUSD?: number;
+  customerTaxExemptApplied?: boolean;
+  fiscalCompliance?: {
+    invoiceType?: 'STANDARD' | 'SIMPLIFIED';
+    fiscalSignature?: string;
+    verificationUrl?: string;
+  };
   payment: SalePayment;
   paymentStatus: 'PAID' | 'CREDIT' | 'PARTIALLY_REFUNDED' | 'REFUNDED';
   cashSessionId?: string;
@@ -260,12 +371,18 @@ export interface ReceiptSnapshot {
     name: string;
     quantity: number;
     unitSymbol: string;
+    sellingTier?: SellingTier;
+    tierLabel?: string;
+    unitLabel?: string;
+    baseUnitQuantity?: number;
     unitPriceUSD: number;
     totalUSD: number;
     totalLRD: number;
+    taxStatus?: 'TAXABLE' | 'ZERO_RATED' | 'EXEMPT';
   }[];
   subtotalUSD: number;
   taxUSD: number;
+  taxLRD?: number;
   discountUSD: number;
   totalUSD: number;
   totalLRD: number;
@@ -276,6 +393,18 @@ export interface ReceiptSnapshot {
   changeLRD: number;
   exchangeRateUsed: number;
   reprintCount: number;
+  // Tax & Fiscal Snapshot
+  taxSnapshot?: TaxSnapshot;
+  taxName?: string;
+  taxRatePercent?: number;
+  taxCalculationType?: 'EXCLUSIVE' | 'INCLUSIVE';
+  storeTIN?: string;
+  customerTIN?: string;
+  taxableAmountUSD?: number;
+  taxableAmountLRD?: number;
+  exemptAmountUSD?: number;
+  zeroRatedAmountUSD?: number;
+  customerTaxExemptApplied?: boolean;
 }
 
 export interface CashSession {

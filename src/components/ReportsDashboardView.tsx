@@ -14,6 +14,9 @@ import {
   Layers,
   ChevronDown,
   Sparkles,
+  Percent,
+  ShieldCheck,
+  Receipt,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -98,10 +101,22 @@ export const ReportsDashboardView: React.FC<ReportsDashboardViewProps> = ({
   }, [sales, timeRange]);
 
   // Aggregate metrics for filtered sales
+  // 1. Gross Sales (Total charged / invoiced to customers)
   const totalSalesUSD = filteredSales.reduce((sum, s) => sum + s.totalUSD, 0);
   const totalSalesLRD = filteredSales.reduce((sum, s) => sum + s.totalLRD, 0);
   const totalTransactions = filteredSales.length;
   const avgTicketUSD = totalTransactions > 0 ? totalSalesUSD / totalTransactions : 0;
+
+  // 2. Tax / VAT Collected (Government Tax Liability - Separated from Business Income)
+  const totalTaxUSD = filteredSales.reduce((sum, s) => sum + (s.taxUSD || 0), 0);
+  const totalTaxLRD = filteredSales.reduce(
+    (sum, s) => sum + (s.taxLRD || Math.round((s.taxUSD || 0) * settings.exchangeRate)),
+    0
+  );
+
+  // 3. Net Sales Revenue (Sales Revenue != Tax Collected != Profit)
+  const netRevenueUSD = Math.max(0, totalSalesUSD - totalTaxUSD);
+  const netRevenueLRD = Math.max(0, totalSalesLRD - totalTaxLRD);
 
   // Physical cash received in the period
   const cashReceivedUSD = filteredSales.reduce((sum, s) => {
@@ -122,12 +137,18 @@ export const ReportsDashboardView: React.FC<ReportsDashboardViewProps> = ({
     return sum;
   }, 0);
 
-  // Profit calculation for the period
+  // 4. Cost of Goods Sold (COGS)
   const totalCostUSD = filteredSales.reduce((sum, s) => {
     return sum + s.items.reduce((lineSum, it) => lineSum + it.quantity * it.unitCostUSD, 0);
   }, 0);
-  const grossProfitUSD = Math.max(0, totalSalesUSD - totalCostUSD);
-  const grossProfitMargin = totalSalesUSD > 0 ? (grossProfitUSD / totalSalesUSD) * 100 : 0;
+
+  // 5. True Gross Profit (Net Revenue minus COGS — Does NOT count Tax as profit)
+  const grossProfitUSD = Math.max(0, netRevenueUSD - totalCostUSD);
+  const grossProfitMargin = netRevenueUSD > 0 ? (grossProfitUSD / netRevenueUSD) * 100 : 0;
+
+  // Taxable and exempt volume totals
+  const totalTaxableBaseUSD = filteredSales.reduce((sum, s) => sum + (s.taxableAmountUSD || (s.taxUSD && s.taxUSD > 0 ? s.subtotalUSD : 0)), 0);
+  const totalExemptBaseUSD = filteredSales.reduce((sum, s) => sum + (s.exemptAmountUSD || (s.customerTaxExemptApplied ? s.subtotalUSD : 0)), 0);
 
   // Inventory value (snapshot)
   const totalStockValueUSD = products.reduce((acc, p) => acc + p.currentStock * p.costPriceUSD, 0);
@@ -431,12 +452,12 @@ export const ReportsDashboardView: React.FC<ReportsDashboardViewProps> = ({
         {/* SUBTAB 1: Summary & Financials */}
         {reportSubTab === 'summary' && (
           <div className="space-y-4">
-            {/* Primary KPI Cards */}
+            {/* Primary KPI Cards (Sales Revenue != Tax Collected != Profit) */}
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
-              {/* Total Revenue */}
+              {/* Gross Sales */}
               <div className="p-4 bg-white border border-stone-200 rounded-2xl space-y-1 shadow-2xs">
                 <div className="text-stone-500 font-bold flex items-center justify-between">
-                  <span>Gross Sales</span>
+                  <span>Gross Sales (Invoiced)</span>
                   <DollarSign className="w-4 h-4 text-blue-600" />
                 </div>
                 <div className="text-2xl font-black text-stone-900 font-mono">
@@ -447,18 +468,46 @@ export const ReportsDashboardView: React.FC<ReportsDashboardViewProps> = ({
                 </div>
               </div>
 
+              {/* Tax / VAT Collected (Government Liability) */}
+              <div className="p-4 bg-white border border-purple-200 rounded-2xl space-y-1 shadow-2xs">
+                <div className="text-purple-700 font-bold flex items-center justify-between">
+                  <span>Tax / VAT Collected</span>
+                  <Percent className="w-4 h-4 text-purple-600" />
+                </div>
+                <div className="text-2xl font-black text-purple-700 font-mono">
+                  ${totalTaxUSD.toFixed(2)}
+                </div>
+                <div className="text-[11px] text-purple-900/70 font-mono">
+                  L$ {totalTaxLRD.toLocaleString()} (Tax Liability)
+                </div>
+              </div>
+
+              {/* Net Sales Revenue */}
+              <div className="p-4 bg-white border border-blue-200 rounded-2xl space-y-1 shadow-2xs">
+                <div className="text-blue-800 font-bold flex items-center justify-between">
+                  <span>Net Business Revenue</span>
+                  <Receipt className="w-4 h-4 text-blue-600" />
+                </div>
+                <div className="text-2xl font-black text-blue-800 font-mono">
+                  ${netRevenueUSD.toFixed(2)}
+                </div>
+                <div className="text-[11px] text-stone-500 font-mono">
+                  Sales minus Tax Collected
+                </div>
+              </div>
+
               {/* Estimated Gross Profit */}
               {canViewCostAndProfit ? (
-                <div className="p-4 bg-white border border-stone-200 rounded-2xl space-y-1 shadow-2xs">
+                <div className="p-4 bg-white border border-emerald-200 rounded-2xl space-y-1 shadow-2xs">
                   <div className="text-emerald-700 font-bold flex items-center justify-between">
-                    <span>Estimated Profit</span>
+                    <span>True Gross Profit</span>
                     <TrendingUp className="w-4 h-4 text-emerald-600" />
                   </div>
                   <div className="text-2xl font-black text-emerald-700 font-mono">
                     ${grossProfitUSD.toFixed(2)}
                   </div>
                   <div className="text-[11px] text-stone-500">
-                    Gross Margin: <strong className="text-stone-900">{grossProfitMargin.toFixed(1)}%</strong>
+                    Net Margin: <strong className="text-stone-900">{grossProfitMargin.toFixed(1)}%</strong> (COGS: ${totalCostUSD.toFixed(2)})
                   </div>
                 </div>
               ) : (
@@ -468,32 +517,45 @@ export const ReportsDashboardView: React.FC<ReportsDashboardViewProps> = ({
                   <div className="text-[11px] text-stone-500">Avg ticket: ${avgTicketUSD.toFixed(2)}</div>
                 </div>
               )}
+            </div>
 
-              {/* Cash USD Received */}
-              <div className="p-4 bg-white border border-stone-200 rounded-2xl space-y-1 shadow-2xs">
-                <div className="text-emerald-800 font-bold flex items-center justify-between">
-                  <span>Physical Cash (USD)</span>
-                  <DollarSign className="w-4 h-4 text-emerald-600" />
+            {/* Tax & Fiscal Compliance Ledger Box */}
+            <div className="p-4 bg-purple-50/60 dark:bg-purple-950/20 border border-purple-200 dark:border-purple-800 rounded-2xl space-y-2.5 text-xs">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="w-7 h-7 rounded-lg bg-purple-600 text-white flex items-center justify-center">
+                    <Percent className="w-3.5 h-3.5" />
+                  </div>
+                  <div>
+                    <h4 className="font-bold text-stone-900 dark:text-white text-xs">
+                      Tax & Fiscal Compliance Summary ({settings.taxName || 'GST'})
+                    </h4>
+                    <p className="text-[11px] text-stone-500">
+                      Clear accounting segregation: <strong>Sales Revenue ≠ Tax Collected ≠ Profit</strong>
+                    </p>
+                  </div>
                 </div>
-                <div className="text-2xl font-black text-emerald-800 font-mono">
-                  ${cashReceivedUSD.toFixed(2)}
-                </div>
-                <div className="text-[11px] text-stone-500 font-mono">
-                  Cash collected in drawer
+                <div className="text-[11px] font-mono text-stone-600">
+                  Store TIN: <strong>{settings.storeTIN || 'N/A'}</strong>
                 </div>
               </div>
 
-              {/* Cash LRD Received */}
-              <div className="p-4 bg-white border border-stone-200 rounded-2xl space-y-1 shadow-2xs">
-                <div className="text-amber-800 font-bold flex items-center justify-between">
-                  <span>Physical Cash (LRD)</span>
-                  <span className="text-xs font-black text-amber-700 font-mono">L$</span>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 font-mono text-xs">
+                <div className="p-2.5 bg-white dark:bg-stone-900 rounded-xl border border-stone-200 dark:border-stone-800">
+                  <span className="text-[10px] text-stone-500 font-sans block">Tax Liability (USD)</span>
+                  <span className="font-bold text-purple-700 dark:text-purple-300 text-sm">${totalTaxUSD.toFixed(2)}</span>
                 </div>
-                <div className="text-2xl font-black text-amber-800 font-mono">
-                  L$ {cashReceivedLRD.toLocaleString()}
+                <div className="p-2.5 bg-white dark:bg-stone-900 rounded-xl border border-stone-200 dark:border-stone-800">
+                  <span className="text-[10px] text-stone-500 font-sans block">Tax Liability (LRD)</span>
+                  <span className="font-bold text-purple-700 dark:text-purple-300 text-sm">L$ {totalTaxLRD.toLocaleString()}</span>
                 </div>
-                <div className="text-[11px] text-stone-500 font-mono">
-                  Liberian dollars in register
+                <div className="p-2.5 bg-white dark:bg-stone-900 rounded-xl border border-stone-200 dark:border-stone-800">
+                  <span className="text-[10px] text-stone-500 font-sans block">Taxable Sales Base</span>
+                  <span className="font-bold text-stone-900 dark:text-white text-sm">${totalTaxableBaseUSD.toFixed(2)}</span>
+                </div>
+                <div className="p-2.5 bg-white dark:bg-stone-900 rounded-xl border border-stone-200 dark:border-stone-800">
+                  <span className="text-[10px] text-stone-500 font-sans block">Exempt / Zero-Rated</span>
+                  <span className="font-bold text-emerald-700 dark:text-emerald-400 text-sm">${totalExemptBaseUSD.toFixed(2)}</span>
                 </div>
               </div>
             </div>

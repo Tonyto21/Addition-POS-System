@@ -24,6 +24,10 @@ import {
   Package,
   Save,
   CheckCircle2,
+  Boxes,
+  Lock,
+  ShieldCheck,
+  AlertTriangle,
 } from 'lucide-react';
 import {
   BusinessSettings,
@@ -34,10 +38,17 @@ import {
   ReceiptSnapshot,
   Sale,
   SalePayment,
+  SellingTier,
   User as UserType,
 } from '../types';
 import { playBeep } from '../utils/audio';
 import { OfflineStorageManager } from '../utils/storage';
+import {
+  calculateOrderTax,
+  formatStockWithCartons,
+  getSellingTiers,
+  TierOption,
+} from '../utils/tierAndTaxUtils';
 import { BarcodeScannerModal } from './BarcodeScannerModal';
 import { ReceiptModal } from './ReceiptModal';
 import { SquareKeypad } from './SquareKeypad';
@@ -167,6 +178,17 @@ export const PosView: React.FC<PosViewProps> = ({
   const [scannerOpen, setScannerOpen] = useState(false);
   const [scannerFeedback, setScannerFeedback] = useState<string | null>(null);
 
+  // Unit Choice Prompt Modal (Option A: high-contrast Retail vs Wholesale choice)
+  const [unitSelectProduct, setUnitSelectProduct] = useState<Product | null>(null);
+
+  // Sale Mode catalog filter: 'ALL' | 'WHOLESALE_ONLY' | 'RETAIL_ONLY'
+  const [saleModeCatalogFilter, setSaleModeCatalogFilter] = useState<'ALL' | 'WHOLESALE_ONLY' | 'RETAIL_ONLY'>('ALL');
+
+  // Manager Authorization Modal when modifying order during checkout
+  const [managerAuthModalOpen, setManagerAuthModalOpen] = useState(false);
+  const [managerPinInput, setManagerPinInput] = useState('');
+  const [managerAuthError, setManagerAuthError] = useState<string | null>(null);
+
   // Checkout modal
   const [checkoutOpen, setCheckoutOpen] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('CASH_USD');
@@ -182,13 +204,26 @@ export const PosView: React.FC<PosViewProps> = ({
   // Held Carts (Suspend / Resume)
   const [heldCarts, setHeldCarts] = useState<{ id: string; time: string; customerName?: string; items: CartItem[] }[]>([]);
 
-  // Calculation totals
-  const subtotalUSD = cart.reduce((acc, it) => acc + it.totalUSD, 0);
-  const discountUSD = overallDiscountUSD;
-  const taxableAmount = Math.max(0, subtotalUSD - discountUSD);
-  const taxUSD = settings.taxEnabled ? taxableAmount * (settings.taxRatePercent / 100) : 0;
-  const grandTotalUSD = Math.max(0, taxableAmount + taxUSD);
-  const grandTotalLRD = Math.round(grandTotalUSD * settings.exchangeRate);
+  // Selected tier per product card (e.g. for multiple selling tiers Full, Half, Quarter, Piece)
+  const [cardSelectedTier, setCardSelectedTier] = useState<Record<string, SellingTier>>({});
+
+  // Unified, line-aware Tax Calculation respecting Customer Exemption, Inclusive/Exclusive tax, and Line statuses
+  const orderTax = calculateOrderTax({
+    items: cart,
+    overallDiscountUSD,
+    settings,
+    exchangeRate: settings.exchangeRate,
+    customerTaxExempt: selectedCustomer?.taxExempt,
+  });
+
+  const subtotalUSD = orderTax.subtotalUSD;
+  const subtotalLRD = orderTax.subtotalLRD;
+  const discountUSD = orderTax.discountUSD;
+  const taxableAmount = orderTax.taxableAmountUSD;
+  const taxUSD = orderTax.taxUSD;
+  const taxLRD = orderTax.taxLRD;
+  const grandTotalUSD = orderTax.grandTotalUSD;
+  const grandTotalLRD = orderTax.grandTotalLRD;
 
   // Handle Barcode Scan event: Autofills scanned number into search, finds item, adds to order, and closes modal
   const handleBarcodeScan = (barcode: string) => {
@@ -227,9 +262,39 @@ export const PosView: React.FC<PosViewProps> = ({
     }
   };
 
-  const addToCart = (product: Product, quantityToAdd: number = 1) => {
+  const handleItemClick = (product: Product) => {
+    // If product has a wholesale package / tiers defined, open tier choice modal
+    if (product.hasPackageUnit && (product.packageMultiplier || 1) > 1) {
+      setUnitSelectProduct(product);
+    } else {
+      addToCart(product, 1, 'PIECE');
+    }
+  };
+
+  const addToCart = (
+    product: Product,
+    quantityToAdd: number = 1,
+    tier: SellingTier = 'PIECE',
+    overridePriceUSD?: number,
+    overridePriceLRD?: number
+  ) => {
+    const tiers = getSellingTiers(product, settings.exchangeRate);
+    const targetTier = tiers.find((t) => t.tier === tier) || tiers[0];
+
+    const baseMult = targetTier.multiplier;
+    const unitLabel = targetTier.name;
+    const tierLabel = targetTier.shortBadge;
+    const mode: 'RETAIL' | 'WHOLESALE' = tier === 'PIECE' ? 'RETAIL' : 'WHOLESALE';
+
+    const priceUSD = typeof overridePriceUSD === 'number' ? overridePriceUSD : targetTier.priceUSD;
+    const priceLRD = typeof overridePriceLRD === 'number' ? overridePriceLRD : targetTier.priceLRD;
+
     setCart((prev) => {
-      const existingIdx = prev.findIndex((item) => item.product.id === product.id);
+      // Find matching item with same product ID AND same sellingTier (or mode)
+      const existingIdx = prev.findIndex(
+        (item) => item.product.id === product.id && (item.sellingTier ? item.sellingTier === tier : item.saleMode === mode)
+      );
+
       if (existingIdx >= 0) {
         const updated = [...prev];
         const current = updated[existingIdx];
@@ -244,15 +309,21 @@ export const PosView: React.FC<PosViewProps> = ({
         };
         return updated;
       } else {
-        const totalUSD = quantityToAdd * product.sellingPriceUSD;
+        const totalUSD = quantityToAdd * priceUSD;
         const totalLRD = Math.round(totalUSD * settings.exchangeRate);
         return [
           ...prev,
           {
             product,
             quantity: quantityToAdd,
-            unitPriceUSD: product.sellingPriceUSD,
-            unitPriceLRD: product.sellingPriceLRD,
+            saleMode: mode,
+            sellingTier: tier,
+            unitLabel,
+            tierLabel,
+            taxStatus: product.taxStatus || 'TAXABLE',
+            baseUnitQuantity: baseMult,
+            unitPriceUSD: priceUSD,
+            unitPriceLRD: priceLRD,
             discountUSD: 0,
             totalUSD,
             totalLRD,
@@ -260,6 +331,39 @@ export const PosView: React.FC<PosViewProps> = ({
         ];
       }
     });
+  };
+
+  // Toggle existing cart item between Retail (single unit) and Wholesale (defined package)
+  const toggleCartItemSaleMode = (productId: string, currentMode: 'RETAIL' | 'WHOLESALE') => {
+    setCart((prev) =>
+      prev.map((item) => {
+        if (item.product.id === productId && item.saleMode === currentMode) {
+          if (!item.product.hasPackageUnit) return item;
+
+          const newMode: 'RETAIL' | 'WHOLESALE' = currentMode === 'RETAIL' ? 'WHOLESALE' : 'RETAIL';
+          const newTier: SellingTier = newMode === 'WHOLESALE' ? 'FULL' : 'PIECE';
+          const tiers = getSellingTiers(item.product, settings.exchangeRate);
+          const targetTier = tiers.find((t) => t.tier === newTier) || tiers[0];
+
+          const totalUSD = item.quantity * targetTier.priceUSD;
+          const totalLRD = Math.round(totalUSD * settings.exchangeRate);
+
+          return {
+            ...item,
+            saleMode: newMode,
+            sellingTier: newTier,
+            unitLabel: targetTier.name,
+            tierLabel: targetTier.shortBadge,
+            baseUnitQuantity: targetTier.multiplier,
+            unitPriceUSD: targetTier.priceUSD,
+            unitPriceLRD: targetTier.priceLRD,
+            totalUSD,
+            totalLRD,
+          };
+        }
+        return item;
+      })
+    );
   };
 
   // Add custom manual item from Square numpad
@@ -285,17 +389,23 @@ export const PosView: React.FC<PosViewProps> = ({
       updatedAt: new Date().toISOString(),
     };
 
-    addToCart(customProd, 1);
+    addToCart(customProd, 1, 'PIECE');
   };
 
-  const updateQuantity = (productId: string, newQty: number) => {
+  const updateQuantity = (
+    productId: string,
+    newQty: number,
+    tier?: SellingTier,
+    mode?: 'RETAIL' | 'WHOLESALE'
+  ) => {
     if (newQty <= 0) {
-      removeFromCart(productId);
+      removeFromCart(productId, tier, mode);
       return;
     }
     setCart((prev) =>
       prev.map((item) => {
-        if (item.product.id === productId) {
+        const matchesTier = tier ? item.sellingTier === tier : (!item.sellingTier && item.saleMode === mode);
+        if (item.product.id === productId && (matchesTier || (!tier && !mode))) {
           const qty = item.product.allowFractions ? Math.round(newQty * 100) / 100 : Math.round(newQty);
           const totalUSD = qty * item.unitPriceUSD;
           const totalLRD = Math.round(totalUSD * settings.exchangeRate);
@@ -311,8 +421,19 @@ export const PosView: React.FC<PosViewProps> = ({
     );
   };
 
-  const removeFromCart = (productId: string) => {
-    setCart((prev) => prev.filter((it) => it.product.id !== productId));
+  const removeFromCart = (
+    productId: string,
+    tier?: SellingTier,
+    mode?: 'RETAIL' | 'WHOLESALE'
+  ) => {
+    setCart((prev) =>
+      prev.filter((it) => {
+        if (it.product.id !== productId) return true;
+        if (tier && it.sellingTier) return it.sellingTier !== tier;
+        if (mode && !it.sellingTier) return it.saleMode !== mode;
+        return false;
+      })
+    );
   };
 
   const clearCart = () => {
@@ -405,14 +526,25 @@ export const PosView: React.FC<PosViewProps> = ({
       cashierName: activeUser.name,
       customerId: selectedCustomer ? selectedCustomer.id : undefined,
       customerName: selectedCustomer ? selectedCustomer.name : 'Walk-in Customer',
+      customerTIN: selectedCustomer?.tin,
+      storeTIN: settings.storeTIN,
       items: cart.map((it) => {
         const u = units.find((unt) => unt.id === it.product.unitId);
         return {
           productId: it.product.id,
-          productName: it.product.name,
+          productName: it.tierLabel
+            ? `${it.product.name} [${it.tierLabel}]`
+            : it.saleMode === 'WHOLESALE'
+            ? `${it.product.name} (${it.unitLabel})`
+            : it.product.name,
           barcode: it.product.barcode,
           quantity: it.quantity,
-          unitSymbol: u?.symbol || 'pcs',
+          unitSymbol: it.tierLabel || (it.saleMode === 'WHOLESALE' ? (it.unitLabel || 'pk') : (u?.symbol || 'pcs')),
+          saleMode: it.saleMode,
+          sellingTier: it.sellingTier,
+          tierLabel: it.tierLabel,
+          unitLabel: it.unitLabel,
+          baseUnitQuantity: it.baseUnitQuantity,
           unitPriceUSD: it.unitPriceUSD,
           unitPriceLRD: it.unitPriceLRD,
           unitCostUSD: it.product.costPriceUSD || 0,
@@ -421,11 +553,27 @@ export const PosView: React.FC<PosViewProps> = ({
         };
       }),
       subtotalUSD,
-      subtotalLRD: Math.round(subtotalUSD * settings.exchangeRate),
+      subtotalLRD,
       discountUSD,
       taxUSD,
+      taxLRD,
       totalUSD: grandTotalUSD,
       totalLRD: grandTotalLRD,
+      taxSnapshot: {
+        taxEnabled: orderTax.taxEnabled,
+        taxName: orderTax.taxName,
+        taxRatePercent: orderTax.taxRatePercent,
+        taxCalculationType: orderTax.taxCalculationType,
+        storeTIN: settings.storeTIN,
+        customerTIN: selectedCustomer?.tin,
+        customerTaxExemptApplied: orderTax.customerTaxExemptApplied,
+        taxableAmountUSD: orderTax.taxableAmountUSD,
+        taxableAmountLRD: orderTax.taxableAmountLRD,
+        exemptAmountUSD: orderTax.exemptAmountUSD,
+        zeroRatedAmountUSD: orderTax.zeroRatedAmountUSD,
+        taxUSD: orderTax.taxUSD,
+        taxLRD: orderTax.taxLRD,
+      },
       payment: salePayment,
       paymentStatus: paymentMethod === 'CREDIT' ? 'CREDIT' : 'PAID',
       cashSessionId: activeSession?.id,
@@ -433,7 +581,7 @@ export const PosView: React.FC<PosViewProps> = ({
       synced: false,
     };
 
-    // Build immutable receipt snapshot
+    // Build immutable receipt snapshot with complete tax and tier context
     const receiptSnapshot: ReceiptSnapshot = {
       id: `rcpt-${Date.now()}`,
       saleId: saleRecord.id,
@@ -446,12 +594,19 @@ export const PosView: React.FC<PosViewProps> = ({
       date: saleRecord.createdAt,
       cashierName: activeUser.name,
       customerName: selectedCustomer?.name,
+      storeTIN: settings.storeTIN,
+      customerTIN: selectedCustomer?.tin,
+      taxName: orderTax.taxName,
+      taxCalculationType: orderTax.taxCalculationType,
+      taxRatePercent: orderTax.taxRatePercent,
+      taxableAmountUSD: orderTax.taxableAmountUSD,
+      taxableAmountLRD: orderTax.taxableAmountLRD,
       items: cart.map((it) => {
         const u = units.find((unt) => unt.id === it.product.unitId);
         return {
-          name: it.product.name,
+          name: it.tierLabel ? `${it.product.name} [${it.tierLabel}]` : it.product.name,
           quantity: it.quantity,
-          unitSymbol: u?.symbol || 'pcs',
+          unitSymbol: it.tierLabel || (it.saleMode === 'WHOLESALE' ? (it.unitLabel || 'pk') : (u?.symbol || 'pcs')),
           unitPriceUSD: it.unitPriceUSD,
           totalUSD: it.totalUSD,
           totalLRD: it.totalLRD,
@@ -459,9 +614,11 @@ export const PosView: React.FC<PosViewProps> = ({
       }),
       subtotalUSD,
       taxUSD,
+      taxLRD,
       discountUSD,
       totalUSD: grandTotalUSD,
       totalLRD: grandTotalLRD,
+      taxSnapshot: saleRecord.taxSnapshot,
       paymentMethod,
       amountPaidUSD: paidUSD,
       amountPaidLRD: paidLRD,
@@ -487,6 +644,52 @@ export const PosView: React.FC<PosViewProps> = ({
     if (onRefreshData) onRefreshData();
   };
 
+  const handleBackToOrder = () => {
+    // If active user is owner, manager, or superadmin, allow direct return without PIN
+    if (activeUser.role === 'owner' || activeUser.role === 'manager' || activeUser.role === 'superadmin') {
+      setCheckoutOpen(false);
+      setScannerFeedback('Returned to active order. Items are retained.');
+      setTimeout(() => setScannerFeedback(null), 2500);
+    } else {
+      // Cashier requires Manager or Owner approval to modify the order
+      setManagerPinInput('');
+      setManagerAuthError(null);
+      setManagerAuthModalOpen(true);
+    }
+  };
+
+  const handleConfirmManagerUnlock = (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanPin = managerPinInput.trim();
+    if (!cleanPin) {
+      setManagerAuthError('Please enter a manager or owner PIN');
+      return;
+    }
+
+    const allUsers = OfflineStorageManager.getUsers();
+    const authorizedUser = allUsers.find(
+      (u) =>
+        (u.role === 'owner' || u.role === 'manager' || u.role === 'superadmin') &&
+        u.pin === cleanPin &&
+        u.isActive
+    );
+
+    if (authorizedUser) {
+      OfflineStorageManager.logAudit(
+        'pos_order_unlock',
+        'ORDER',
+        `order-modify-${Date.now()}`,
+        `${authorizedUser.name} (${authorizedUser.role}) authorized cashier ${activeUser.name} to modify items in checkout`
+      );
+      setManagerAuthModalOpen(false);
+      setCheckoutOpen(false);
+      setScannerFeedback(`✅ Order unlocked by ${authorizedUser.name}! Items retained for editing.`);
+      setTimeout(() => setScannerFeedback(null), 3500);
+    } else {
+      setManagerAuthError('Incorrect PIN. Authorization must be provided by a Store Manager or Shop Owner.');
+    }
+  };
+
   const filteredProducts = products.filter((p) => {
     const q = searchQuery.trim().toLowerCase();
     const matchesSearch =
@@ -498,7 +701,12 @@ export const PosView: React.FC<PosViewProps> = ({
 
     const matchesCategory = selectedCategory === 'all' || p.categoryId === selectedCategory;
 
-    return matchesSearch && matchesCategory;
+    const matchesSaleMode =
+      saleModeCatalogFilter === 'ALL' ||
+      (saleModeCatalogFilter === 'WHOLESALE_ONLY' && p.hasPackageUnit) ||
+      (saleModeCatalogFilter === 'RETAIL_ONLY' && !p.hasPackageUnit);
+
+    return matchesSearch && matchesCategory && matchesSaleMode;
   });
 
   // Handle Enter press in search input (autofill, add to order, and clear for next item)
@@ -576,31 +784,31 @@ export const PosView: React.FC<PosViewProps> = ({
   return (
     <div className="flex-1 flex flex-col lg:flex-row h-full overflow-hidden bg-stone-100 text-stone-900">
       {/* MOBILE VIEW SWITCHER (Visible on screens < lg) */}
-      <div className="lg:hidden bg-stone-900 text-white p-2.5 flex items-center justify-between gap-2 shrink-0 shadow-md">
-        <div className="flex items-center bg-stone-800 p-1 rounded-xl border border-stone-700">
+      <div className="lg:hidden bg-stone-900 text-white p-2 flex items-center justify-between shrink-0 shadow-md">
+        <div className="flex items-center bg-stone-800 p-1 rounded-xl border border-stone-700 w-full">
           <button
             onClick={() => setMobileTab('catalog')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+            className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
               mobileTab === 'catalog' ? 'bg-white text-stone-900 shadow-sm' : 'text-stone-300 hover:text-white'
             }`}
           >
-            <LayoutGrid className="w-3.5 h-3.5" />
+            <LayoutGrid className="w-4 h-4 shrink-0" />
             <span>Items & Keypad</span>
           </button>
           <button
             onClick={() => setMobileTab('cart')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+            className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
               mobileTab === 'cart'
                 ? 'bg-emerald-500 text-stone-950 font-black shadow-sm'
                 : cart.length > 0
-                ? 'text-emerald-400 font-bold'
+                ? 'text-emerald-400 font-bold hover:bg-stone-700/60'
                 : 'text-stone-300 hover:text-white'
             }`}
           >
-            <ShoppingCart className="w-3.5 h-3.5" />
-            <span>Order ({cart.reduce((sum, it) => sum + it.quantity, 0)})</span>
+            <ShoppingCart className="w-4 h-4 shrink-0" />
+            <span>Cart ({cart.reduce((sum, it) => sum + it.quantity, 0)})</span>
             {cart.length > 0 && (
-              <span className="font-mono text-[10px] bg-emerald-400 text-stone-950 px-1.5 py-0.5 rounded font-black">
+              <span className="font-mono text-[10px] bg-emerald-400 text-stone-950 px-1.5 py-0.5 rounded font-black shrink-0">
                 L$ {grandTotalLRD.toLocaleString()}
               </span>
             )}
@@ -735,32 +943,78 @@ export const PosView: React.FC<PosViewProps> = ({
             )}
           </div>
 
-          {/* Categories Scrollable Pills when in Library mode */}
+          {/* Categories and Sale Mode Scrollable Filter Bar */}
           {catalogMode === 'library' && (
-            <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-xs no-scrollbar">
-              <button
-                onClick={() => setSelectedCategory('all')}
-                className={`px-3 py-1 rounded-full font-semibold whitespace-nowrap text-xs transition ${
-                  selectedCategory === 'all'
-                    ? 'bg-stone-900 text-white shadow-2xs'
-                    : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
-                }`}
-              >
-                All Items ({products.length})
-              </button>
-              {categories.map((c) => (
+            <div className="flex flex-col gap-1.5 pb-1">
+              {/* Sale Mode Selector Bar (All Goods vs Wholesale Packs vs Retail Singles) */}
+              <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
+                <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider shrink-0 mr-0.5">
+                  Sale Mode:
+                </span>
+                <div className="flex items-center gap-1 bg-stone-100 p-0.5 rounded-xl border border-stone-200 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setSaleModeCatalogFilter('ALL')}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold transition ${
+                      saleModeCatalogFilter === 'ALL'
+                        ? 'bg-stone-900 text-white shadow-2xs'
+                        : 'text-stone-600 hover:text-stone-900'
+                    }`}
+                  >
+                    All Goods ({products.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSaleModeCatalogFilter('WHOLESALE_ONLY')}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold transition flex items-center gap-1 ${
+                      saleModeCatalogFilter === 'WHOLESALE_ONLY'
+                        ? 'bg-amber-600 text-white shadow-2xs font-extrabold'
+                        : 'text-amber-900 hover:bg-amber-100'
+                    }`}
+                  >
+                    <Boxes className="w-3.5 h-3.5" />
+                    <span>Wholesale Bulk Packs ({products.filter((p) => p.hasPackageUnit).length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSaleModeCatalogFilter('RETAIL_ONLY')}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold transition ${
+                      saleModeCatalogFilter === 'RETAIL_ONLY'
+                        ? 'bg-emerald-600 text-white shadow-2xs font-extrabold'
+                        : 'text-emerald-900 hover:bg-emerald-100'
+                    }`}
+                  >
+                    Retail Only
+                  </button>
+                </div>
+              </div>
+
+              {/* Categories Scrollable Pills */}
+              <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-xs no-scrollbar">
                 <button
-                  key={c.id}
-                  onClick={() => setSelectedCategory(c.id)}
+                  onClick={() => setSelectedCategory('all')}
                   className={`px-3 py-1 rounded-full font-semibold whitespace-nowrap text-xs transition ${
-                    selectedCategory === c.id
+                    selectedCategory === 'all'
                       ? 'bg-stone-900 text-white shadow-2xs'
                       : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
                   }`}
                 >
-                  {c.name}
+                  All Categories ({products.length})
                 </button>
-              ))}
+                {categories.map((c) => (
+                  <button
+                    key={c.id}
+                    onClick={() => setSelectedCategory(c.id)}
+                    className={`px-3 py-1 rounded-full font-semibold whitespace-nowrap text-xs transition ${
+                      selectedCategory === c.id
+                        ? 'bg-stone-900 text-white shadow-2xs'
+                        : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
+                    }`}
+                  >
+                    {c.name}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -778,7 +1032,29 @@ export const PosView: React.FC<PosViewProps> = ({
                 const u = units.find((unt) => unt.id === product.unitId);
                 const isLowStock = product.currentStock <= product.minStockLevel && product.currentStock > 0;
                 const isOutOfStock = product.currentStock <= 0;
-                const itemInCart = cart.find((it) => it.product.id === product.id);
+
+                const tiers = getSellingTiers(product, settings.exchangeRate);
+                const hasTiers = tiers.length > 1;
+
+                // Current selected tier on this card (defaults to FULL or PIECE)
+                const activeTier: SellingTier = cardSelectedTier[product.id] || (hasTiers ? 'FULL' : 'PIECE');
+                const activeTierOption = tiers.find((t) => t.tier === activeTier) || tiers[0];
+
+                // Check how many of the active tier are in the cart
+                const tierInCart = cart.find(
+                  (it) => it.product.id === product.id && (it.sellingTier ? it.sellingTier === activeTier : (activeTier === 'PIECE' ? it.saleMode === 'RETAIL' : it.saleMode === 'WHOLESALE'))
+                );
+                const totalItemCartQty = cart
+                  .filter((it) => it.product.id === product.id)
+                  .reduce((sum, it) => sum + it.quantity, 0);
+
+                // Human-friendly dual stock breakdown
+                const stockBreakdown = formatStockWithCartons(
+                  product.currentStock,
+                  product.packageMultiplier,
+                  product.packageUnitName,
+                  u?.symbol || 'pcs'
+                );
 
                 // Color accent badge based on category
                 const categoryColors: Record<string, string> = {
@@ -793,8 +1069,8 @@ export const PosView: React.FC<PosViewProps> = ({
                 return (
                   <div
                     key={product.id}
-                    onClick={() => addToCart(product, 1)}
-                    className={`group relative p-3 rounded-xl bg-white border border-stone-200 ${topBorder} border-t-4 transition-all cursor-pointer flex flex-col justify-between hover:shadow-md hover:border-stone-400 active:scale-[0.98] select-none ${
+                    onClick={() => handleItemClick(product)}
+                    className={`group relative p-3 rounded-xl bg-white border border-stone-200 ${topBorder} border-t-4 transition-all cursor-pointer flex flex-col justify-between hover:shadow-md hover:border-stone-400 active:scale-[0.99] select-none ${
                       isOutOfStock ? 'opacity-70 bg-stone-50' : ''
                     }`}
                   >
@@ -810,7 +1086,7 @@ export const PosView: React.FC<PosViewProps> = ({
                         </div>
                       )}
 
-                      {/* Top Row: Stock info & Admin Quick Edit Icon */}
+                      {/* Top Row: Stock breakdown & Admin Quick Edit */}
                       <div className="flex items-center justify-between text-[11px] mb-1">
                         <span className="font-mono text-stone-400 text-[10px] truncate max-w-[70px]">
                           {product.sku}
@@ -822,11 +1098,17 @@ export const PosView: React.FC<PosViewProps> = ({
                             </span>
                           ) : isLowStock ? (
                             <span className="text-[10px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.2 rounded">
-                              {product.currentStock} {u?.symbol} left
+                              {product.currentStock} {u?.symbol || 'pcs'} left
                             </span>
                           ) : (
-                            <span className="text-[10px] font-medium text-stone-500 font-mono">
-                              {product.currentStock} {u?.symbol}
+                            <span className="text-[10px] font-medium text-stone-500 font-mono" title={stockBreakdown.fullDisplay}>
+                              {stockBreakdown.breakdownFormatted ? (
+                                <span className="text-stone-700 font-bold">
+                                  {product.currentStock} {u?.symbol || 'pcs'} <span className="text-stone-400 text-[9px] font-normal">({stockBreakdown.breakdownFormatted})</span>
+                                </span>
+                              ) : (
+                                <span>{stockBreakdown.fullDisplay}</span>
+                              )}
                             </span>
                           )}
 
@@ -867,54 +1149,107 @@ export const PosView: React.FC<PosViewProps> = ({
                       )}
                     </div>
 
-                    {/* Price in both LRD and USD (with USD-pegged or LRD-pegged indicators) & Add button */}
-                    <div className="pt-2 mt-2 border-t border-stone-100 flex items-center justify-between">
-                      {product.pricingCurrency === 'USD' ? (
-                        <div>
-                          <div className="font-black text-stone-900 font-mono text-sm leading-tight flex items-center gap-1">
-                            <span>${product.sellingPriceUSD.toFixed(2)}</span>
-                            <span className="text-[9px] font-black px-1.5 py-0.2 rounded bg-blue-100 text-blue-900 uppercase tracking-wider">
-                              USD Peg
-                            </span>
+                    {/* Clean Pricing & Selling Tier Section (No cramped stacked boxes!) */}
+                    <div className="pt-2 mt-2 border-t border-stone-100 space-y-2">
+                      {hasTiers ? (
+                        <>
+                          {/* Sleek Horizontal Segmented Tier Switcher: Full, Half, Quarter, Piece */}
+                          <div
+                            className="flex items-center gap-1 p-0.5 bg-stone-100 rounded-lg border border-stone-200"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {tiers.map((t) => {
+                              const isSelected = t.tier === activeTier;
+                              const shortTitle =
+                                t.tier === 'FULL'
+                                  ? 'Full'
+                                  : t.tier === 'THREE_QUARTERS'
+                                  ? '¾'
+                                  : t.tier === 'HALF'
+                                  ? '½'
+                                  : t.tier === 'QUARTER'
+                                  ? '¼'
+                                  : '1 Pc';
+                              return (
+                                <button
+                                  key={t.tier}
+                                  type="button"
+                                  onClick={() =>
+                                    setCardSelectedTier((prev) => ({ ...prev, [product.id]: t.tier }))
+                                  }
+                                  className={`flex-1 py-1 px-1 rounded-md text-[10px] font-black transition text-center whitespace-nowrap ${
+                                    isSelected
+                                      ? 'bg-stone-900 text-white shadow-2xs'
+                                      : 'text-stone-600 hover:text-stone-900 hover:bg-stone-200/60'
+                                  }`}
+                                  title={`${t.label} (Click card for full details)`}
+                                >
+                                  {shortTitle}
+                                </button>
+                              );
+                            })}
                           </div>
-                          <div className="text-[10px] font-bold font-mono text-stone-500">
-                            ≈ L$ {(product.sellingPriceLRD || Math.round(product.sellingPriceUSD * settings.exchangeRate)).toLocaleString()} LRD
+
+                          {/* Active Tier Price and Prominent Add Button */}
+                          <div className="flex items-center justify-between pt-0.5">
+                            <div className="min-w-0 pr-1">
+                              <div className="font-black text-stone-900 font-mono text-xs sm:text-sm leading-tight truncate">
+                                L$ {activeTierOption.priceLRD.toLocaleString()}
+                              </div>
+                              <div className="text-[10px] font-bold text-stone-500 font-mono truncate">
+                                ${activeTierOption.priceUSD.toFixed(2)} USD • <span className="text-stone-700">{activeTierOption.pieceCountLabel}</span>
+                              </div>
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                addToCart(product, 1, activeTier);
+                                playBeep('success');
+                              }}
+                              className={`px-2.5 py-1.5 rounded-lg text-[11px] font-black transition flex items-center gap-1 shrink-0 ${
+                                tierInCart
+                                  ? 'bg-emerald-600 text-white shadow-2xs hover:bg-emerald-700'
+                                  : 'bg-stone-900 hover:bg-stone-800 text-white shadow-2xs active:scale-95'
+                              }`}
+                              title={`Add 1 × ${activeTierOption.name} to order`}
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                              <span>{tierInCart ? `${tierInCart.quantity} in cart` : '+ Add'}</span>
+                            </button>
                           </div>
-                        </div>
-                      ) : product.pricingCurrency === 'LRD' ? (
-                        <div>
-                          <div className="font-black text-stone-900 font-mono text-sm leading-tight flex items-center gap-1">
-                            <span>L$ {(product.sellingPriceLRD || Math.round(product.sellingPriceUSD * settings.exchangeRate)).toLocaleString()}</span>
-                            <span className="text-[9px] font-black px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-900 uppercase tracking-wider">
-                              LRD Peg
-                            </span>
-                          </div>
-                          <div className="text-[10px] font-bold font-mono text-stone-500">
-                            ≈ ${product.sellingPriceUSD.toFixed(2)} USD
-                          </div>
-                        </div>
+                        </>
                       ) : (
-                        <div>
-                          <div className="font-black text-stone-900 font-mono text-sm leading-tight">
-                            L$ {(product.sellingPriceLRD || Math.round(product.sellingPriceUSD * settings.exchangeRate)).toLocaleString()}
+                        /* Standard Single Piece Item */
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <div className="font-black text-stone-900 font-mono text-sm leading-tight">
+                              L$ {activeTierOption.priceLRD.toLocaleString()}
+                            </div>
+                            <div className="text-[10px] font-bold font-mono text-stone-500">
+                              ${activeTierOption.priceUSD.toFixed(2)} USD
+                            </div>
                           </div>
-                          <div className="text-[10px] font-bold font-mono text-stone-500">
-                            ${product.sellingPriceUSD.toFixed(2)} USD
-                          </div>
+
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              addToCart(product, 1, 'PIECE');
+                              playBeep('success');
+                            }}
+                            className={`px-2.5 py-1.5 rounded-lg text-[11px] font-black transition flex items-center gap-1 ${
+                              totalItemCartQty > 0
+                                ? 'bg-emerald-600 text-white shadow-2xs hover:bg-emerald-700'
+                                : 'bg-stone-900 hover:bg-stone-800 text-white shadow-2xs active:scale-95'
+                            }`}
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                            <span>{totalItemCartQty > 0 ? `${totalItemCartQty} in order` : '+ Add'}</span>
+                          </button>
                         </div>
                       )}
-
-                      <div className="flex items-center gap-1">
-                        {itemInCart ? (
-                          <span className="px-2 py-1 rounded-lg bg-emerald-600 text-white font-black text-[11px] font-mono shadow-xs">
-                            {itemInCart.quantity} in order
-                          </span>
-                        ) : (
-                          <span className="px-2.5 py-1 rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-800 font-bold text-[11px] border border-stone-200">
-                            + Add
-                          </span>
-                        )}
-                      </div>
                     </div>
                   </div>
                 );
@@ -1071,69 +1406,154 @@ export const PosView: React.FC<PosViewProps> = ({
           ) : (
             cart.map((item) => {
               const u = units.find((unt) => unt.id === item.product.unitId);
+              const isWholesale = item.saleMode === 'WHOLESALE';
+              const hasMultiUnit = Boolean(item.product.hasPackageUnit);
+              const tierBadge = item.tierLabel || item.unitLabel || (isWholesale ? 'Pack' : 'Single');
+
               return (
                 <div
-                  key={item.product.id}
-                  className="p-2.5 bg-stone-50/70 border border-stone-200/80 rounded-xl flex items-center justify-between gap-2 hover:bg-stone-50 transition"
+                  key={`${item.product.id}-${item.sellingTier || item.saleMode}`}
+                  className={`p-2.5 rounded-xl border transition flex flex-col gap-1.5 ${
+                    isWholesale
+                      ? 'bg-amber-50/70 border-amber-300/80 shadow-2xs'
+                      : 'bg-stone-50/70 border-stone-200/80 hover:bg-stone-50'
+                  }`}
                 >
-                  <div className="flex items-center gap-2 flex-1 min-w-0">
-                    {item.product.imageUrl && (
-                      <img
-                        src={item.product.imageUrl}
-                        alt={item.product.name}
-                        className="w-9 h-9 rounded-lg object-cover border border-stone-200 shrink-0 bg-white"
-                      />
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 flex-1 min-w-0">
+                      {item.product.imageUrl && (
+                        <img
+                          src={item.product.imageUrl}
+                          alt={item.product.name}
+                          className="w-9 h-9 rounded-lg object-cover border border-stone-200 shrink-0 bg-white"
+                        />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="text-xs font-bold text-stone-900 truncate flex items-center gap-1.5">
+                          <span>{item.product.name}</span>
+                        </div>
+
+                        {/* Price breakdown */}
+                        <div className="text-[11px] text-stone-600 font-mono font-bold flex items-center gap-1.5">
+                          {item.product.pricingCurrency === 'USD' ? (
+                            <>
+                              <span className="text-blue-900 font-black">${item.unitPriceUSD.toFixed(2)} USD</span>
+                              <span className="text-[9px] font-extrabold px-1 py-0.2 rounded bg-blue-100 text-blue-800 border border-blue-200">USD</span>
+                              <span className="text-[10px] text-stone-400 font-normal">
+                                (≈ L$ {Math.round(item.unitPriceUSD * settings.exchangeRate).toLocaleString()})
+                              </span>
+                            </>
+                          ) : item.product.pricingCurrency === 'LRD' ? (
+                            <>
+                              <span className="text-emerald-900 font-black">L$ {item.unitPriceLRD.toLocaleString()} LRD</span>
+                              <span className="text-[9px] font-extrabold px-1 py-0.2 rounded bg-emerald-100 text-emerald-800 border border-emerald-200">LRD</span>
+                              <span className="text-[10px] text-stone-400 font-normal">
+                                (≈ ${(item.unitPriceLRD / settings.exchangeRate).toFixed(2)})
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              <span>L$ {(item.unitPriceLRD || Math.round(item.unitPriceUSD * settings.exchangeRate)).toLocaleString()}</span>
+                              <span className="text-[10px] text-stone-400 font-normal">(${item.unitPriceUSD.toFixed(2)})</span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Quantity Stepper */}
+                    <div className="flex items-center bg-white border border-stone-200 rounded-lg p-0.5 shadow-2xs shrink-0">
+                      <button
+                        onClick={() =>
+                          updateQuantity(
+                            item.product.id,
+                            item.quantity - (item.product.allowFractions ? 0.5 : 1),
+                            item.sellingTier,
+                            item.saleMode
+                          )
+                        }
+                        className="w-7 h-7 sm:w-6 sm:h-6 rounded flex items-center justify-center text-stone-700 hover:bg-stone-100 active:scale-95 transition"
+                      >
+                        <Minus className="w-3.5 h-3.5" />
+                      </button>
+
+                      <span className="w-8 text-center text-xs font-mono font-bold text-stone-900">
+                        {item.quantity}
+                      </span>
+
+                      <button
+                        onClick={() =>
+                          updateQuantity(
+                            item.product.id,
+                            item.quantity + (item.product.allowFractions ? 0.5 : 1),
+                            item.sellingTier,
+                            item.saleMode
+                          )
+                        }
+                        className="w-7 h-7 sm:w-6 sm:h-6 rounded flex items-center justify-center text-stone-700 hover:bg-stone-100 active:scale-95 transition"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+
+                    {/* Line Total */}
+                    <div className="text-right min-w-[70px] shrink-0">
+                      <div className="text-xs font-black text-stone-900 font-mono">
+                        L$ {item.totalLRD.toLocaleString()}
+                      </div>
+                      <div className="text-[10px] text-stone-500 font-mono">
+                        ${item.totalUSD.toFixed(2)} USD
+                      </div>
+                    </div>
+
+                    {/* Delete Item */}
+                    <button
+                      onClick={() => removeFromCart(item.product.id, item.sellingTier, item.saleMode)}
+                      className="p-1.5 text-stone-400 hover:text-rose-600 rounded-md hover:bg-rose-50 transition shrink-0"
+                      title="Remove from order"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+
+                  {/* Mode Badges & Stock Deduction Note */}
+                  <div className="flex items-center justify-between pt-1 border-t border-stone-200/60 text-[10px]">
+                    <div className="flex items-center gap-1.5">
+                      <span
+                        className={`px-2 py-0.5 rounded-full font-extrabold flex items-center gap-1 ${
+                          item.sellingTier === 'FULL'
+                            ? 'bg-amber-600 text-white shadow-2xs'
+                            : item.sellingTier === 'THREE_QUARTERS'
+                            ? 'bg-indigo-600 text-white shadow-2xs'
+                            : item.sellingTier === 'HALF'
+                            ? 'bg-blue-600 text-white shadow-2xs'
+                            : item.sellingTier === 'QUARTER'
+                            ? 'bg-purple-600 text-white shadow-2xs'
+                            : isWholesale
+                            ? 'bg-amber-600 text-white shadow-2xs'
+                            : 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                        }`}
+                      >
+                        {isWholesale && <Boxes className="w-3 h-3" />}
+                        <span>{tierBadge.toUpperCase()}</span>
+                      </span>
+
+                      <span className="text-stone-500 font-mono">
+                        Deducts: <strong>{Math.round(item.quantity * item.baseUnitQuantity * 100) / 100}</strong> {u?.symbol || 'base units'}
+                      </span>
+                    </div>
+
+                    {hasMultiUnit && (
+                      <button
+                        type="button"
+                        onClick={() => toggleCartItemSaleMode(item.product.id, item.saleMode)}
+                        className="px-2 py-0.5 rounded font-bold transition text-[10px] bg-stone-100 hover:bg-stone-200 text-stone-700 border border-stone-300"
+                        title="Toggle single / pack"
+                      >
+                        <span>Switch Mode</span>
+                      </button>
                     )}
-                    <div className="min-w-0 flex-1">
-                      <div className="text-xs font-bold text-stone-900 truncate">
-                        {item.product.name}
-                      </div>
-                      <div className="text-[11px] text-stone-600 font-mono font-bold">
-                        L$ {(item.unitPriceLRD || Math.round(item.unitPriceUSD * settings.exchangeRate)).toLocaleString()}
-                        <span className="text-[10px] text-stone-400 font-normal ml-1">(${item.unitPriceUSD.toFixed(2)})</span>
-                      </div>
-                    </div>
                   </div>
-
-                  {/* Quantity Stepper */}
-                  <div className="flex items-center bg-white border border-stone-200 rounded-lg p-0.5 shadow-2xs">
-                    <button
-                      onClick={() => updateQuantity(item.product.id, item.quantity - (item.product.allowFractions ? 0.5 : 1))}
-                      className="w-7 h-7 sm:w-6 sm:h-6 rounded flex items-center justify-center text-stone-700 hover:bg-stone-100 active:scale-95 transition"
-                    >
-                      <Minus className="w-3.5 h-3.5" />
-                    </button>
-
-                    <span className="w-8 text-center text-xs font-mono font-bold text-stone-900">
-                      {item.quantity}
-                    </span>
-
-                    <button
-                      onClick={() => updateQuantity(item.product.id, item.quantity + (item.product.allowFractions ? 0.5 : 1))}
-                      className="w-7 h-7 sm:w-6 sm:h-6 rounded flex items-center justify-center text-stone-700 hover:bg-stone-100 active:scale-95 transition"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-
-                  {/* Line Total */}
-                  <div className="text-right min-w-[70px]">
-                    <div className="text-xs font-black text-stone-900 font-mono">
-                      L$ {item.totalLRD.toLocaleString()}
-                    </div>
-                    <div className="text-[10px] text-stone-500 font-mono">
-                      ${item.totalUSD.toFixed(2)} USD
-                    </div>
-                  </div>
-
-                  {/* Delete Item */}
-                  <button
-                    onClick={() => removeFromCart(item.product.id)}
-                    className="p-1.5 text-stone-400 hover:text-rose-600 rounded-md hover:bg-rose-50 transition"
-                    title="Remove from order"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
                 </div>
               );
             })
@@ -1147,17 +1567,30 @@ export const PosView: React.FC<PosViewProps> = ({
             <div className="flex justify-between text-stone-500">
               <span>Subtotal:</span>
               <span className="font-mono font-medium text-stone-800">
-                L$ {Math.round(subtotalUSD * settings.exchangeRate).toLocaleString()} (${subtotalUSD.toFixed(2)})
+                L$ {subtotalLRD.toLocaleString()} (${subtotalUSD.toFixed(2)})
               </span>
             </div>
 
             {settings.taxEnabled && (
-              <div className="flex justify-between text-stone-500">
-                <span>Tax ({settings.taxRatePercent}%):</span>
-                <span className="font-mono font-medium text-stone-800">
-                  L$ {Math.round(taxUSD * settings.exchangeRate).toLocaleString()} (${taxUSD.toFixed(2)})
-                </span>
-              </div>
+              selectedCustomer?.taxExempt ? (
+                <div className="flex justify-between items-center text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-1 rounded-lg">
+                  <span className="font-bold flex items-center gap-1">
+                    <span>🛡️ {settings.taxName || 'GST'} Exempt:</span>
+                  </span>
+                  <span className="font-mono font-bold text-emerald-900">
+                    0% Applied (Exempt NGO)
+                  </span>
+                </div>
+              ) : (
+                <div className="flex justify-between text-stone-600">
+                  <span>
+                    {settings.taxName || 'GST'} ({settings.taxRatePercent}% {settings.taxCalculationType === 'INCLUSIVE' ? 'Inclusive' : 'Exclusive'}):
+                  </span>
+                  <span className="font-mono font-medium text-stone-900">
+                    L$ {taxLRD.toLocaleString()} (${taxUSD.toFixed(2)})
+                  </span>
+                </div>
+              )
             )}
 
             {/* Quick Discount Trigger */}
@@ -1454,8 +1887,8 @@ export const PosView: React.FC<PosViewProps> = ({
               </div>
             )}
 
-            {/* Complete Transaction Button */}
-            <div className="pt-2">
+            {/* Complete Transaction & Back to Order Buttons */}
+            <div className="pt-2 space-y-2">
               <button
                 type="button"
                 onClick={handleCompleteSale}
@@ -1465,7 +1898,84 @@ export const PosView: React.FC<PosViewProps> = ({
                 <Check className="w-4 h-4" />
                 <span>Complete Sale & Issue Receipt</span>
               </button>
+
+              <button
+                type="button"
+                onClick={handleBackToOrder}
+                className="w-full py-2.5 bg-stone-100 hover:bg-stone-200 text-stone-700 font-bold text-xs rounded-xl transition flex items-center justify-center gap-1.5 border border-stone-200"
+                title="Return to order to re-enter goods without deleting the order"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                <span>Back to Modify Order (Items Retained)</span>
+              </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Manager Authorization PIN Modal (for modifying order from checkout) */}
+      {managerAuthModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs animate-in fade-in duration-150">
+          <div className="bg-white border border-stone-200 w-full max-w-sm rounded-2xl p-5 space-y-4 text-xs shadow-2xl">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-amber-100 text-amber-800 border border-amber-300 flex items-center justify-center shrink-0">
+                <Lock className="w-5 h-5 text-amber-700" />
+              </div>
+              <div>
+                <h3 className="text-sm font-extrabold text-stone-900">Manager Authorization</h3>
+                <p className="text-[11px] text-stone-500 mt-0.5">
+                  Enter Manager or Shop Owner PIN to unlock and modify this order.
+                </p>
+              </div>
+            </div>
+
+            <form onSubmit={handleConfirmManagerUnlock} className="space-y-3 pt-1">
+              <div>
+                <label className="text-stone-700 font-bold block mb-1">
+                  Manager / Owner PIN
+                </label>
+                <input
+                  type="password"
+                  autoFocus
+                  maxLength={6}
+                  value={managerPinInput}
+                  onChange={(e) => {
+                    setManagerPinInput(e.target.value);
+                    setManagerAuthError(null);
+                  }}
+                  placeholder="Enter 4-digit PIN (default 1234)"
+                  className="w-full bg-stone-50 border border-stone-300 rounded-xl px-3 py-2 text-stone-900 font-mono text-center text-lg tracking-widest font-black focus:outline-none focus:bg-white focus:border-stone-900"
+                />
+              </div>
+
+              {managerAuthError && (
+                <div className="p-2 bg-rose-50 border border-rose-200 text-rose-700 text-[11px] font-bold rounded-lg flex items-center gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-rose-600" />
+                  <span>{managerAuthError}</span>
+                </div>
+              )}
+
+              <p className="text-[10px] text-stone-500">
+                All existing goods in this order will remain intact so you can adjust quantities or fix mistakes without resetting.
+              </p>
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-stone-100">
+                <button
+                  type="button"
+                  onClick={() => setManagerAuthModalOpen(false)}
+                  className="px-3 py-2 bg-stone-100 hover:bg-stone-200 text-stone-700 rounded-xl font-bold transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-stone-900 hover:bg-stone-800 text-white rounded-xl font-bold transition shadow-xs flex items-center gap-1.5"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <span>Authorize & Modify</span>
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
@@ -1693,6 +2203,133 @@ export const PosView: React.FC<PosViewProps> = ({
               >
                 <Trash2 className="w-3.5 h-3.5" />
                 <span>Delete Permanently</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Option A: High-Contrast Retail vs Wholesale Unit Choice Modal */}
+      {unitSelectProduct && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs animate-in fade-in duration-150">
+          <div className="bg-white border border-stone-200 w-full max-w-md rounded-2xl p-5 sm:p-6 space-y-4 text-xs shadow-2xl">
+            <div className="flex items-start justify-between border-b border-stone-100 pb-3">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-amber-100 text-amber-900 border border-amber-300 flex items-center justify-center shrink-0">
+                  <Boxes className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-extrabold text-stone-900 leading-tight">
+                    {unitSelectProduct.name}
+                  </h3>
+                  <p className="text-[11px] text-stone-500 mt-0.5">
+                    How is this item being sold to the customer?
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setUnitSelectProduct(null)}
+                className="p-1 text-stone-400 hover:text-stone-900 rounded-lg hover:bg-stone-100"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Current Stock Banner */}
+            <div className="p-3 bg-stone-50 border border-stone-200 rounded-xl flex items-center justify-between text-xs">
+              <span className="text-stone-600 font-medium">Inventory Stock on Shelf:</span>
+              <span className="font-bold text-stone-900 font-mono text-sm">
+                {(() => {
+                  const u = units.find((unt) => unt.id === unitSelectProduct.unitId);
+                  return formatStockWithCartons(
+                    unitSelectProduct.currentStock,
+                    unitSelectProduct.packageMultiplier,
+                    unitSelectProduct.packageUnitName,
+                    u?.symbol || 'pcs'
+                  ).fullDisplay;
+                })()}
+              </span>
+            </div>
+
+            {/* Selling Tier Options: Large, High-Contrast, Mistake-Proof */}
+            <div className="space-y-2.5 max-h-[55vh] overflow-y-auto pr-1">
+              {getSellingTiers(unitSelectProduct, settings.exchangeRate).map((t) => {
+                const isFull = t.tier === 'FULL';
+                const isThreeQuarter = t.tier === 'THREE_QUARTERS';
+                const isHalf = t.tier === 'HALF';
+                const isQuarter = t.tier === 'QUARTER';
+                const isPiece = t.tier === 'PIECE';
+
+                const badgeBg = isFull
+                  ? 'bg-amber-600 text-white'
+                  : isThreeQuarter
+                  ? 'bg-indigo-600 text-white'
+                  : isHalf
+                  ? 'bg-blue-600 text-white'
+                  : isQuarter
+                  ? 'bg-purple-600 text-white'
+                  : 'bg-emerald-600 text-white';
+
+                const cardBorder = isFull
+                  ? 'border-amber-300 hover:border-amber-500 bg-amber-50/70 hover:bg-amber-100/80'
+                  : isThreeQuarter
+                  ? 'border-indigo-300 hover:border-indigo-500 bg-indigo-50/70 hover:bg-indigo-100/80'
+                  : isHalf
+                  ? 'border-blue-300 hover:border-blue-500 bg-blue-50/70 hover:bg-blue-100/80'
+                  : isQuarter
+                  ? 'border-purple-300 hover:border-purple-500 bg-purple-50/70 hover:bg-purple-100/80'
+                  : 'border-emerald-300 hover:border-emerald-500 bg-emerald-50/70 hover:bg-emerald-100/80';
+
+                return (
+                  <button
+                    key={t.tier}
+                    type="button"
+                    onClick={() => {
+                      addToCart(unitSelectProduct, 1, t.tier);
+                      setUnitSelectProduct(null);
+                      playBeep('success');
+                    }}
+                    className={`w-full p-3.5 border-2 rounded-2xl text-left transition shadow-xs flex items-center justify-between group active:scale-[0.98] ${cardBorder}`}
+                  >
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider ${badgeBg}`}>
+                          {t.tier === 'FULL' ? 'Full Pack' : t.tier === 'HALF' ? '1/2 Pack' : t.tier === 'QUARTER' ? '1/4 Pack' : 'Retail Single'}
+                        </span>
+                        <span className="font-extrabold text-stone-900 text-sm">
+                          {t.name}
+                        </span>
+                        {t.isCustomPrice && (
+                          <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-white text-stone-700 border border-stone-300">
+                            Custom Price
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-stone-600 mt-1">
+                        Deducts <strong>{t.multiplier} base unit{t.multiplier === 1 ? '' : 's'}</strong> from stock ({t.pieceCountLabel})
+                      </p>
+                    </div>
+
+                    <div className="text-right shrink-0 pl-3">
+                      <div className="font-black text-stone-950 text-base font-mono">
+                        L$ {t.priceLRD.toLocaleString()}
+                      </div>
+                      <div className="text-[10px] text-stone-600 font-mono font-bold">
+                        ${t.priceUSD.toFixed(2)} USD
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="flex items-center justify-end pt-2 border-t border-stone-100">
+              <button
+                type="button"
+                onClick={() => setUnitSelectProduct(null)}
+                className="px-4 py-2 bg-stone-100 hover:bg-stone-200 text-stone-700 font-bold rounded-xl transition"
+              >
+                Cancel
               </button>
             </div>
           </div>

@@ -79,6 +79,12 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   const [showPins, setShowPins] = useState<boolean>(true);
   const [feedback, setFeedback] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
 
+  // Filter out superadmin accounts when viewing as Shop Owner or regular staff
+  const visibleUsers = users.filter((u) => {
+    if (activeUser.role === 'superadmin') return true;
+    return u.role !== 'superadmin' && u.id !== 'usr-super';
+  });
+
   // Edit / Add Modal State
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
@@ -129,6 +135,10 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   };
 
   const handleOpenEditModal = (u: User) => {
+    if (activeUser.role !== 'superadmin' && (u.role === 'superadmin' || u.id === 'usr-super')) {
+      notify('You do not have permission to view or modify this account.', 'error');
+      return;
+    }
     setEditingUserId(u.id);
     setName(u.name);
     setUsername(u.username);
@@ -212,6 +222,11 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       return;
     }
 
+    if (activeUser.role !== 'superadmin' && role === 'superadmin') {
+      notify('You do not have authorization to assign the Super Admin role.', 'error');
+      return;
+    }
+
     const userToSave: User = {
       id: editingUserId || `usr-${Date.now()}`,
       name: name.trim(),
@@ -241,6 +256,11 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
   const handleDeleteUser = () => {
     if (!deleteCandidate) return;
+    if (deleteCandidate.role === 'superadmin' || deleteCandidate.id === 'usr-super') {
+      notify('The Master Developer / Super Admin account cannot be removed.', 'error');
+      setDeleteCandidate(null);
+      return;
+    }
     if (deleteCandidate.id === activeUser.id) {
       notify('Cannot delete the staff account currently logged in.', 'error');
       setDeleteCandidate(null);
@@ -258,7 +278,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     setDeleteCandidate(null);
   };
 
-  const roleBadgeColors = {
+  const roleBadgeColors: Record<string, string> = {
+    superadmin: 'bg-amber-100 text-amber-900 border-amber-300',
     owner: 'bg-purple-100 text-purple-800 border-purple-200',
     manager: 'bg-blue-100 text-blue-800 border-blue-200',
     cashier: 'bg-emerald-100 text-emerald-800 border-emerald-200',
@@ -278,7 +299,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                 Staff Management & Module Access
               </h3>
               <p className="text-[11px] text-stone-500">
-                Assign employee responsibilities, set 4-digit PINs, and grant access to specific POS modules.
+                Managing {visibleUsers.length} staff accounts. Set 4-digit PINs, credentials, and POS module permissions.
               </p>
             </div>
           </div>
@@ -324,7 +345,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
       {/* Staff Accounts Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-3.5">
-        {users.map((u) => {
+        {visibleUsers.map((u) => {
           const isMe = activeUser.id === u.id;
           const userMods: AppModuleId[] = u.allowedModules || (
             u.role === 'owner' ? ['pos', 'inventory', 'orders', 'reports', 'settings'] :

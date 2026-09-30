@@ -10,7 +10,7 @@ interface ApkExportModalProps {
 export const ApkExportModal: React.FC<ApkExportModalProps> = ({ isOpen, onClose }) => {
   const { isInstallable, isInstalled, isAndroid, install } = usePWAInstall();
   const [copiedUrl, setCopiedUrl] = useState(false);
-  const [activeGuideTab, setActiveGuideTab] = useState<'pwabuilder' | 'direct' | 'cli'>('pwabuilder');
+  const [activeGuideTab, setActiveGuideTab] = useState<'ios' | 'pwabuilder' | 'direct' | 'cli'>('ios');
 
   if (!isOpen) return null;
 
@@ -83,41 +83,118 @@ export const ApkExportModal: React.FC<ApkExportModalProps> = ({ isOpen, onClose 
           </div>
 
           {/* Navigation Tabs for Methods */}
-          <div className="flex border-b border-stone-800 gap-1 pb-1">
+          <div className="flex border-b border-stone-800 gap-1 pb-1 overflow-x-auto">
+            <button
+              onClick={() => setActiveGuideTab('ios')}
+              className={`px-3 py-2 rounded-t-lg font-bold transition flex items-center gap-1.5 whitespace-nowrap ${
+                activeGuideTab === 'ios'
+                  ? 'bg-stone-800 text-blue-400 border-b-2 border-blue-500'
+                  : 'text-stone-400 hover:text-stone-200'
+              }`}
+            >
+              <Smartphone className="w-3.5 h-3.5 text-blue-400" />
+              <span>iPhone / iOS (Instant Web App)</span>
+            </button>
             <button
               onClick={() => setActiveGuideTab('pwabuilder')}
-              className={`px-3 py-2 rounded-t-lg font-bold transition flex items-center gap-1.5 ${
+              className={`px-3 py-2 rounded-t-lg font-bold transition flex items-center gap-1.5 whitespace-nowrap ${
                 activeGuideTab === 'pwabuilder'
                   ? 'bg-stone-800 text-blue-400 border-b-2 border-blue-500'
                   : 'text-stone-400 hover:text-stone-200'
               }`}
             >
               <Download className="w-3.5 h-3.5" />
-              <span>Method 1: PWABuilder (1-Click APK)</span>
+              <span>Android APK (PWABuilder)</span>
             </button>
             <button
               onClick={() => setActiveGuideTab('direct')}
-              className={`px-3 py-2 rounded-t-lg font-bold transition flex items-center gap-1.5 ${
+              className={`px-3 py-2 rounded-t-lg font-bold transition flex items-center gap-1.5 whitespace-nowrap ${
                 activeGuideTab === 'direct'
                   ? 'bg-stone-800 text-blue-400 border-b-2 border-blue-500'
                   : 'text-stone-400 hover:text-stone-200'
               }`}
             >
               <Smartphone className="w-3.5 h-3.5" />
-              <span>Method 2: Direct Chrome Install</span>
+              <span>Android Chrome Install</span>
             </button>
             <button
               onClick={() => setActiveGuideTab('cli')}
-              className={`px-3 py-2 rounded-t-lg font-bold transition flex items-center gap-1.5 ${
+              className={`px-3 py-2 rounded-t-lg font-bold transition flex items-center gap-1.5 whitespace-nowrap ${
                 activeGuideTab === 'cli'
                   ? 'bg-stone-800 text-blue-400 border-b-2 border-blue-500'
                   : 'text-stone-400 hover:text-stone-200'
               }`}
             >
               <Terminal className="w-3.5 h-3.5" />
-              <span>Method 3: Bubblewrap / CLI</span>
+              <span>CLI / Local Build</span>
             </button>
           </div>
+
+          {/* Tab 0: iPhone / iOS Installation Guide */}
+          {activeGuideTab === 'ios' && (
+            <div className="space-y-4">
+              <div className="p-4 bg-stone-950 border border-stone-800 rounded-xl space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xl">🍎</span>
+                    <h4 className="font-bold text-white text-sm">How to Install on iPhone & iPad</h4>
+                  </div>
+                  <span className="text-[10px] bg-blue-500/20 text-blue-400 border border-blue-500/30 px-2 py-0.5 rounded font-mono font-bold">
+                    iOS Web App
+                  </span>
+                </div>
+                
+                <p className="text-stone-300 text-xs leading-relaxed">
+                  Apple does not allow <code className="bg-stone-800 px-1 py-0.5 rounded text-amber-300">.apk</code> files (which are Android-only). Instead, iOS has built-in support to install web apps directly to the iPhone Home Screen as a native standalone app — with zero App Store fees, full-screen display, and offline support!
+                </p>
+
+                {/* Step-by-step instructions */}
+                <div className="p-3.5 bg-stone-900 border border-stone-800 rounded-xl space-y-3 text-stone-200">
+                  <div className="font-bold text-white text-xs flex items-center gap-1.5">
+                    <span>Follow these 4 simple steps on the iPhone:</span>
+                  </div>
+                  <ol className="space-y-3 list-decimal list-inside text-xs">
+                    <li className="leading-relaxed">
+                      Open <strong className="text-white">Safari</strong> on the iPhone and navigate to your link:
+                      <div className="mt-1.5 flex items-center gap-2">
+                        <input
+                          type="text"
+                          readOnly
+                          value={appUrl}
+                          className="w-full bg-stone-950 border border-stone-700 rounded-lg px-2.5 py-1.5 font-mono text-[11px] text-white select-all"
+                        />
+                        <button
+                          onClick={handleCopyUrl}
+                          className="px-2.5 py-1.5 bg-stone-800 hover:bg-stone-700 text-white rounded-lg flex items-center gap-1 font-bold transition shrink-0 text-xs"
+                        >
+                          {copiedUrl ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                          <span>{copiedUrl ? 'Copied' : 'Copy'}</span>
+                        </button>
+                      </div>
+                    </li>
+                    <li className="leading-relaxed">
+                      Tap the <strong className="text-blue-400">Share</strong> button at the bottom of Safari (the square icon with an arrow pointing up <span className="font-mono bg-stone-800 px-1 rounded">⎋ / [↑]</span>).
+                    </li>
+                    <li className="leading-relaxed">
+                      Scroll down the list and tap <strong className="text-emerald-400">"Add to Home Screen"</strong> (with a plus [+] icon).
+                    </li>
+                    <li className="leading-relaxed">
+                      Tap <strong className="text-blue-400">"Add"</strong> in the top-right corner.
+                    </li>
+                  </ol>
+                </div>
+
+                <div className="p-3 bg-blue-950/40 border border-blue-800/40 rounded-xl space-y-1.5 text-blue-200 text-xs">
+                  <div className="font-bold text-white flex items-center gap-1.5">
+                    <span>✨ How it works on iPhone:</span>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-stone-300">
+                    Addition POS will launch from the iPhone Home Screen just like a native app: no Safari address bars, with its custom icon, camera barcode scanner, and automatic updates whenever you push improvements.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Tab 1: PWABuilder (Recommended for getting an actual .apk file) */}
           {activeGuideTab === 'pwabuilder' && (

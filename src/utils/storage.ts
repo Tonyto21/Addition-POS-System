@@ -6,6 +6,7 @@ import {
   Category,
   Customer,
   CustomerRepayment,
+  PackageDefinition,
   Product,
   ReceiptSnapshot,
   Sale,
@@ -23,6 +24,7 @@ import {
   INITIAL_CATEGORIES,
   INITIAL_CUSTOMERS,
   INITIAL_MOVEMENTS,
+  INITIAL_PACKAGE_DEFINITIONS,
   INITIAL_PRODUCTS,
   INITIAL_SUPPLIERS,
   INITIAL_UNITS,
@@ -36,6 +38,7 @@ const STORAGE_KEYS = {
   PRODUCTS: 'addition_pos_products',
   CATEGORIES: 'addition_pos_categories',
   UNITS: 'addition_pos_units',
+  PACKAGE_DEFINITIONS: 'addition_pos_package_definitions',
   SUPPLIERS: 'addition_pos_suppliers',
   CUSTOMERS: 'addition_pos_customers',
   REPAYMENTS: 'addition_pos_repayments',
@@ -50,6 +53,7 @@ const STORAGE_KEYS = {
   ACTIVE_USER: 'addition_pos_active_user',
   SYNC_QUEUE: 'addition_pos_sync_queue',
   IS_ONLINE: 'addition_pos_online_mode',
+  DELETED_IDS: 'addition_pos_deleted_ids',
 };
 
 // Safe storage wrapper
@@ -79,38 +83,328 @@ export class OfflineStorageManager {
   // Business Settings
   static getSettings(): BusinessSettings {
     const s = loadItem<BusinessSettings>(STORAGE_KEYS.SETTINGS, DEFAULT_BUSINESS_SETTINGS);
+    let needsSave = false;
+
     // Automatic migration to Addition Business Centre if default placeholder was stored
     if (s.name === 'Addition Shop' || !s.name) {
       s.name = 'Addition Business Centre';
       if (s.receiptHeader && s.receiptHeader.includes('ADDITION SHOP')) {
         s.receiptHeader = s.receiptHeader.replace('ADDITION SHOP', 'ADDITION BUSINESS CENTRE');
       }
+      needsSave = true;
+    }
+
+    // Default tax architecture fields
+    if (!s.taxName) {
+      s.taxName = 'GST';
+      needsSave = true;
+    }
+    if (!s.taxCalculationType) {
+      s.taxCalculationType = 'EXCLUSIVE';
+      needsSave = true;
+    }
+    if (!s.storeTIN) {
+      s.storeTIN = 'TIN-LIB-770921';
+      needsSave = true;
+    }
+
+    // Initialize 30-Day Evaluation Trial if not yet configured
+    if (!s.trialExpiresAt && s.licenseStatus !== 'LIFETIME') {
+      s.trialStartedAt = s.trialStartedAt || new Date().toISOString();
+      s.trialExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      s.licenseStatus = 'TRIAL';
+      s.licensedTo = s.name || 'Client Store';
+      needsSave = true;
+    }
+
+    if (needsSave) {
       this.saveSettings(s);
     }
     return s;
   }
 
+  // License & 30-Day Evaluation Management
+  static getLicenseInfo(): {
+    status: 'TRIAL' | 'ACTIVE' | 'EXPIRED' | 'LIFETIME';
+    expiresAt: string | null;
+    startedAt: string;
+    daysRemaining: number;
+    hoursRemaining: number;
+    isExpired: boolean;
+    licensedTo: string;
+    isLifetime: boolean;
+  } {
+    const s = this.getSettings();
+    const isLifetime = s.licenseStatus === 'LIFETIME';
+    const expiresAt = s.trialExpiresAt || null;
+    const startedAt = s.trialStartedAt || new Date().toISOString();
+    const now = Date.now();
+
+    if (isLifetime) {
+      return {
+        status: 'LIFETIME',
+        expiresAt: null,
+        startedAt,
+        daysRemaining: 9999,
+        hoursRemaining: 99999,
+        isExpired: false,
+        licensedTo: s.licensedTo || s.name,
+        isLifetime: true,
+      };
+    }
+
+    const expiryTime = expiresAt ? new Date(expiresAt).getTime() : now + 30 * 24 * 60 * 60 * 1000;
+    const diffMs = expiryTime - now;
+    const isExpired = diffMs <= 0;
+    const daysRemaining = Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
+    const hoursRemaining = Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60)));
+
+    return {
+      status: isExpired ? 'EXPIRED' : (s.licenseStatus || 'TRIAL'),
+      expiresAt: expiresAt || new Date(expiryTime).toISOString(),
+      startedAt,
+      daysRemaining,
+      hoursRemaining,
+      isExpired,
+      licensedTo: s.licensedTo || s.name,
+      isLifetime: false,
+    };
+  }
+
+  static resetTrialPeriod(days: number = 30, clientName?: string): BusinessSettings {
+    const s = this.getSettings();
+    const now = new Date();
+    s.trialStartedAt = now.toISOString();
+    s.trialExpiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+    s.licenseStatus = 'TRIAL';
+    if (clientName && clientName.trim()) {
+      s.licensedTo = clientName.trim();
+    }
+    s.updatedAt = new Date().toISOString();
+    this.saveSettings(s);
+    this.logAudit(
+      'license_management',
+      'LICENSE',
+      s.id,
+      `Super Admin reset trial period: fresh ${days}-day evaluation granted (Expires: ${s.trialExpiresAt})`
+    );
+    return s;
+  }
+
+  static renewLicense(days: number = 30, newStatus: 'TRIAL' | 'ACTIVE' | 'LIFETIME' = 'ACTIVE'): BusinessSettings {
+    const s = this.getSettings();
+    if (newStatus === 'LIFETIME') {
+      s.licenseStatus = 'LIFETIME';
+      s.trialExpiresAt = undefined;
+    } else {
+      const now = Date.now();
+      const currentExpiry = s.trialExpiresAt ? new Date(s.trialExpiresAt).getTime() : now;
+      const base = currentExpiry > now ? currentExpiry : now;
+      s.trialExpiresAt = new Date(base + days * 24 * 60 * 60 * 1000).toISOString();
+      s.licenseStatus = newStatus;
+    }
+    s.updatedAt = new Date().toISOString();
+    this.saveSettings(s);
+    this.logAudit('license_management', 'LICENSE', s.id, `Extended license by ${days} days (Status: ${newStatus})`);
+    return s;
+  }
+
+  static expireTrialNow(): BusinessSettings {
+    const s = this.getSettings();
+    s.trialExpiresAt = new Date(Date.now() - 60 * 1000).toISOString();
+    s.licenseStatus = 'EXPIRED';
+    s.updatedAt = new Date().toISOString();
+    this.saveSettings(s);
+    this.logAudit('license_management', 'LICENSE', s.id, 'Simulated trial expiration for testing');
+    return s;
+  }
+
+  static setCustomTrialExpiry(isoDateString: string, licensedTo?: string): BusinessSettings {
+    const s = this.getSettings();
+    s.trialExpiresAt = isoDateString;
+    s.licenseStatus = 'ACTIVE';
+    if (licensedTo) s.licensedTo = licensedTo;
+    s.updatedAt = new Date().toISOString();
+    this.saveSettings(s);
+    this.logAudit('license_management', 'LICENSE', s.id, `Set custom trial expiration to ${isoDateString}`);
+    return s;
+  }
+
+  static recalculateProductPrices(newRate: number): number {
+    if (!newRate || newRate <= 0) return 0;
+    const currentProducts = this.getProducts();
+    let updatedCount = 0;
+    const nowIso = new Date().toISOString();
+    const updatedProducts = currentProducts.map((prod) => {
+      let changed = false;
+      const copy = { ...prod, updatedAt: nowIso };
+
+      if (copy.pricingCurrency === 'LRD') {
+        // Base currency is LRD -> recalculate USD equivalent
+        if (copy.sellingPriceLRD > 0) {
+          copy.sellingPriceUSD = Math.round((copy.sellingPriceLRD / newRate) * 100) / 100;
+          changed = true;
+        }
+        if (copy.costPriceLRD && copy.costPriceLRD > 0) {
+          copy.costPriceUSD = Math.round((copy.costPriceLRD / newRate) * 100) / 100;
+          changed = true;
+        }
+      } else {
+        // Base currency is USD or DUAL -> recalculate LRD equivalent
+        if (copy.sellingPriceUSD > 0) {
+          copy.sellingPriceLRD = Math.round(copy.sellingPriceUSD * newRate);
+          changed = true;
+        } else if (copy.sellingPriceLRD > 0) {
+          copy.sellingPriceUSD = Math.round((copy.sellingPriceLRD / newRate) * 100) / 100;
+          changed = true;
+        }
+
+        if (copy.costPriceUSD > 0) {
+          copy.costPriceLRD = Math.round(copy.costPriceUSD * newRate);
+          changed = true;
+        } else if (copy.costPriceLRD && copy.costPriceLRD > 0) {
+          copy.costPriceUSD = Math.round((copy.costPriceLRD / newRate) * 100) / 100;
+          changed = true;
+        }
+      }
+
+      // Recalculate package and fractional tier prices (Full, Half, Quarter) consistently
+      if (copy.hasPackageUnit) {
+        if (copy.pricingCurrency === 'LRD') {
+          if (copy.packagePriceLRD && copy.packagePriceLRD > 0) {
+            copy.packagePriceUSD = Math.round((copy.packagePriceLRD / newRate) * 100) / 100;
+            changed = true;
+          }
+          if (copy.halfPackagePriceLRD && copy.halfPackagePriceLRD > 0) {
+            copy.halfPackagePriceUSD = Math.round((copy.halfPackagePriceLRD / newRate) * 100) / 100;
+            changed = true;
+          }
+          if (copy.quarterPackagePriceLRD && copy.quarterPackagePriceLRD > 0) {
+            copy.quarterPackagePriceUSD = Math.round((copy.quarterPackagePriceLRD / newRate) * 100) / 100;
+            changed = true;
+          }
+        } else {
+          // USD or DUAL
+          if (copy.packagePriceUSD && copy.packagePriceUSD > 0) {
+            copy.packagePriceLRD = Math.round(copy.packagePriceUSD * newRate);
+            changed = true;
+          } else if (copy.packagePriceLRD && copy.packagePriceLRD > 0) {
+            copy.packagePriceUSD = Math.round((copy.packagePriceLRD / newRate) * 100) / 100;
+            changed = true;
+          }
+
+          if (copy.halfPackagePriceUSD && copy.halfPackagePriceUSD > 0) {
+            copy.halfPackagePriceLRD = Math.round(copy.halfPackagePriceUSD * newRate);
+            changed = true;
+          }
+          if (copy.quarterPackagePriceUSD && copy.quarterPackagePriceUSD > 0) {
+            copy.quarterPackagePriceLRD = Math.round(copy.quarterPackagePriceUSD * newRate);
+            changed = true;
+          }
+        }
+      }
+
+      if (changed) updatedCount++;
+      return copy;
+    });
+
+    if (updatedCount > 0) {
+      saveItem(STORAGE_KEYS.PRODUCTS, updatedProducts);
+    }
+    return updatedCount;
+  }
+
+  static isDarkMode(): boolean {
+    const s = this.getSettings();
+    if (typeof s.darkMode === 'boolean') return s.darkMode;
+    try {
+      const stored = localStorage.getItem('addition_pos_theme');
+      if (stored === 'dark') return true;
+      if (stored === 'light') return false;
+      return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    } catch {
+      return false;
+    }
+  }
+
+  static setDarkMode(enabled: boolean): BusinessSettings {
+    const s = this.getSettings();
+    s.darkMode = enabled;
+    s.updatedAt = new Date().toISOString();
+    try {
+      localStorage.setItem('addition_pos_theme', enabled ? 'dark' : 'light');
+    } catch {}
+    if (typeof document !== 'undefined') {
+      if (enabled) {
+        document.documentElement.classList.add('dark');
+      } else {
+        document.documentElement.classList.remove('dark');
+      }
+    }
+    this.saveSettings(s);
+    return s;
+  }
+
   static saveSettings(settings: BusinessSettings): void {
+    const oldSettings = loadItem<BusinessSettings>(STORAGE_KEYS.SETTINGS, DEFAULT_BUSINESS_SETTINGS);
+    const rateChanged = typeof settings.exchangeRate === 'number' && settings.exchangeRate > 0 && settings.exchangeRate !== oldSettings.exchangeRate;
+    
+    settings.updatedAt = settings.updatedAt || new Date().toISOString();
+
+    if (typeof settings.darkMode === 'boolean') {
+      try {
+        localStorage.setItem('addition_pos_theme', settings.darkMode ? 'dark' : 'light');
+      } catch {}
+      if (typeof document !== 'undefined') {
+        if (settings.darkMode) {
+          document.documentElement.classList.add('dark');
+        } else {
+          document.documentElement.classList.remove('dark');
+        }
+      }
+    }
+
     saveItem(STORAGE_KEYS.SETTINGS, settings);
+
+    if (rateChanged) {
+      this.recalculateProductPrices(settings.exchangeRate);
+    }
+
     this.logAudit(
       'manage_settings',
       'SETTINGS',
       settings.id,
       `Updated shop settings. Business Name: ${settings.name}, Rate: 1 USD = ${settings.exchangeRate} LRD`
     );
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('app-storage-updated', {
+          detail: { source: 'save-settings', settings, rateChanged },
+        })
+      );
+    }
   }
 
   // Daily Morning Exchange Rate confirmation
   static confirmExchangeRate(newRate?: number): BusinessSettings {
     const settings = this.getSettings();
-    if (typeof newRate === 'number' && newRate > 0) {
-      settings.exchangeRate = newRate;
-    }
+    const rateToApply = typeof newRate === 'number' && newRate > 0 ? newRate : settings.exchangeRate;
     const today = new Date().toISOString().split('T')[0];
-    settings.lastExchangeRateReviewDate = today;
-    this.saveSettings(settings);
-    window.dispatchEvent(new CustomEvent('app-storage-updated', { detail: { source: 'exchange-rate-confirmed' } }));
-    return settings;
+    const nowIso = new Date().toISOString();
+
+    const updated: BusinessSettings = {
+      ...settings,
+      exchangeRate: rateToApply,
+      lastExchangeRateReviewDate: today,
+      exchangeRateLastConfirmedDate: today,
+      updatedAt: nowIso,
+    };
+
+    this.saveSettings(updated);
+    this.recalculateProductPrices(rateToApply);
+
+    return updated;
   }
 
   static isExchangeRateVerifiedToday(): boolean {
@@ -121,14 +415,23 @@ export class OfflineStorageManager {
 
   // Users & Auth
   static getUsers(): User[] {
-    const list = loadItem<User[]>(STORAGE_KEYS.USERS, INITIAL_USERS);
+    let list = loadItem<User[]>(STORAGE_KEYS.USERS, INITIAL_USERS);
+    // Ensure Super Admin exists if user list is from older local storage
+    if (!list.some((u) => u.role === 'superadmin' || u.id === 'usr-super')) {
+      const superAdminUser = INITIAL_USERS.find((u) => u.id === 'usr-super');
+      if (superAdminUser) {
+        list = [superAdminUser, ...list];
+        saveItem(STORAGE_KEYS.USERS, list);
+      }
+    }
+
     let modified = false;
     const enriched = list.map((u) => {
       if (!u.allowedModules || u.allowedModules.length === 0) {
         modified = true;
         const initial = INITIAL_USERS.find((init) => init.id === u.id);
         const allowed: AppModuleId[] = initial?.allowedModules || (
-          u.role === 'owner' ? ['pos', 'inventory', 'orders', 'reports', 'settings'] :
+          (u.role === 'superadmin' || u.role === 'owner') ? ['pos', 'inventory', 'orders', 'reports', 'settings'] :
           u.role === 'manager' ? ['pos', 'inventory', 'orders', 'reports'] :
           ['pos', 'orders']
         );
@@ -140,8 +443,8 @@ export class OfflineStorageManager {
           canViewCostProfit: u.canViewCostProfit ?? (u.role !== 'cashier'),
           canAdjustInventory: u.canAdjustInventory ?? (u.role !== 'cashier'),
           canReceiveStock: u.canReceiveStock ?? (u.role !== 'cashier'),
-          canManageUsers: u.canManageUsers ?? (u.role === 'owner'),
-          canEditSettings: u.canEditSettings ?? (u.role === 'owner'),
+          canManageUsers: u.canManageUsers ?? (u.role === 'superadmin' || u.role === 'owner'),
+          canEditSettings: u.canEditSettings ?? (u.role === 'superadmin' || u.role === 'owner'),
         };
       }
       return u;
@@ -159,7 +462,11 @@ export class OfflineStorageManager {
       const live = users.find((u) => u.id === saved.id && u.isActive);
       if (live) return live;
     }
-    return users[0]; // default to Owner
+    // Default to the Shop Owner / client profile
+    const defaultUser = users.find((u) => u.role === 'owner' && u.isActive) ||
+      users.find((u) => u.role !== 'superadmin' && u.isActive) ||
+      users[0];
+    return defaultUser;
   }
 
   static setActiveUser(user: User): void {
@@ -195,8 +502,25 @@ export class OfflineStorageManager {
   }
 
   // Categories & Units
+  // Deleted items tombstone tracking (prevents cloud sync resurrection)
+  static getDeletedIds(): string[] {
+    return loadItem<string[]>(STORAGE_KEYS.DELETED_IDS, []);
+  }
+
+  static trackDeletedId(id: string): void {
+    if (!id) return;
+    const current = this.getDeletedIds();
+    if (!current.includes(id)) {
+      current.push(id);
+      saveItem(STORAGE_KEYS.DELETED_IDS, current);
+    }
+  }
+
   static getCategories(): Category[] {
-    return loadItem<Category[]>(STORAGE_KEYS.CATEGORIES, INITIAL_CATEGORIES);
+    const deleted = new Set(this.getDeletedIds());
+    const raw = loadItem<Category[]>(STORAGE_KEYS.CATEGORIES, INITIAL_CATEGORIES);
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((c) => !deleted.has(c.id));
   }
 
   static saveCategory(cat: Category): void {
@@ -214,6 +538,7 @@ export class OfflineStorageManager {
     if (isUsed) {
       return false; // cannot delete category that has products
     }
+    this.trackDeletedId(id);
     const list = this.getCategories().filter((c) => c.id !== id);
     saveItem(STORAGE_KEYS.CATEGORIES, list);
     this.logAudit('manage_categories', 'CATEGORY', id, `Deleted unused category`);
@@ -224,9 +549,104 @@ export class OfflineStorageManager {
     return loadItem<Unit[]>(STORAGE_KEYS.UNITS, INITIAL_UNITS);
   }
 
+  static saveUnit(unit: Unit): void {
+    const list = this.getUnits();
+    const idx = list.findIndex((u) => u.id === unit.id);
+    if (idx >= 0) list[idx] = unit;
+    else list.push(unit);
+    saveItem(STORAGE_KEYS.UNITS, list);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('app-storage-updated', { detail: { key: STORAGE_KEYS.UNITS } }));
+    }
+  }
+
+  // Package Definitions (Wholesale & Bulk Containers: Dozen, Carton, Crate, Box, Bundle, etc.)
+  static getPackageDefinitions(): PackageDefinition[] {
+    return loadItem<PackageDefinition[]>(STORAGE_KEYS.PACKAGE_DEFINITIONS, INITIAL_PACKAGE_DEFINITIONS);
+  }
+
+  static savePackageDefinition(pkg: PackageDefinition): void {
+    const list = this.getPackageDefinitions();
+    const idx = list.findIndex((p) => p.id === pkg.id);
+    if (idx >= 0) list[idx] = pkg;
+    else list.push(pkg);
+    saveItem(STORAGE_KEYS.PACKAGE_DEFINITIONS, list);
+    this.logAudit(
+      'manage_settings',
+      'PACKAGE_DEFINITION',
+      pkg.id,
+      `Saved package definition: ${pkg.name} (${pkg.multiplier} units)`
+    );
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('app-storage-updated', { detail: { key: STORAGE_KEYS.PACKAGE_DEFINITIONS } }));
+    }
+  }
+
+  static deletePackageDefinition(id: string): boolean {
+    const list = this.getPackageDefinitions();
+    const target = list.find((p) => p.id === id);
+    if (!target) return false;
+    const filtered = list.filter((p) => p.id !== id);
+    saveItem(STORAGE_KEYS.PACKAGE_DEFINITIONS, filtered);
+    this.logAudit('manage_settings', 'PACKAGE_DEFINITION', id, `Deleted package definition: ${target.name}`);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('app-storage-updated', { detail: { key: STORAGE_KEYS.PACKAGE_DEFINITIONS } }));
+    }
+    return true;
+  }
+
   // Products
   static getProducts(): Product[] {
-    return loadItem<Product[]>(STORAGE_KEYS.PRODUCTS, INITIAL_PRODUCTS);
+    const deleted = new Set(this.getDeletedIds());
+    const raw = loadItem<Product[]>(STORAGE_KEYS.PRODUCTS, INITIAL_PRODUCTS);
+    if (!Array.isArray(raw)) return [];
+    
+    // Backfill package units & fractional tiers for standard demo items if not present in existing localStorage
+    let modified = false;
+    const backfilled = raw.map((p) => {
+      const initMatch = INITIAL_PRODUCTS.find((ip) => ip.id === p.id);
+      let pModified = false;
+      const copy = { ...p };
+
+      if (!copy.taxStatus) {
+        copy.taxStatus = initMatch?.taxStatus || 'TAXABLE';
+        pModified = true;
+      }
+
+      if (initMatch && initMatch.hasPackageUnit && !copy.hasPackageUnit) {
+        copy.hasPackageUnit = true;
+        copy.packageUnitName = initMatch.packageUnitName;
+        copy.packageMultiplier = initMatch.packageMultiplier;
+        copy.packagePriceUSD = initMatch.packagePriceUSD;
+        copy.packagePriceLRD = initMatch.packagePriceLRD;
+        copy.packageCostUSD = initMatch.packageCostUSD;
+        pModified = true;
+      }
+
+      if (copy.hasPackageUnit && (!copy.halfPackagePriceUSD || !copy.quarterPackagePriceUSD)) {
+        if (initMatch?.halfPackagePriceUSD) {
+          copy.halfPackagePriceUSD = initMatch.halfPackagePriceUSD;
+          copy.halfPackagePriceLRD = initMatch.halfPackagePriceLRD;
+          copy.quarterPackagePriceUSD = initMatch.quarterPackagePriceUSD;
+          copy.quarterPackagePriceLRD = initMatch.quarterPackagePriceLRD;
+        } else {
+          const fullUSD = copy.packagePriceUSD || (copy.sellingPriceUSD * (copy.packageMultiplier || 24) * 0.9);
+          copy.halfPackagePriceUSD = Math.round((fullUSD / 2) * 100) / 100;
+          copy.halfPackagePriceLRD = Math.round(copy.halfPackagePriceUSD * 195);
+          copy.quarterPackagePriceUSD = Math.round((fullUSD / 4) * 100) / 100;
+          copy.quarterPackagePriceLRD = Math.round(copy.quarterPackagePriceUSD * 195);
+        }
+        pModified = true;
+      }
+
+      if (pModified) modified = true;
+      return copy;
+    });
+    if (modified) {
+      saveItem(STORAGE_KEYS.PRODUCTS, backfilled);
+    }
+
+    return backfilled.filter((p) => !deleted.has(p.id));
   }
 
   static getProductById(id: string): Product | undefined {
@@ -263,6 +683,7 @@ export class OfflineStorageManager {
   }
 
   static deleteProduct(productId: string, deletedBy: string): void {
+    this.trackDeletedId(productId);
     const products = this.getProducts().filter((p) => p.id !== productId);
     saveItem(STORAGE_KEYS.PRODUCTS, products);
     this.enqueueSync('STOCK_ADJUSTMENT', { id: productId, isDeleted: true });
@@ -272,6 +693,13 @@ export class OfflineStorageManager {
       productId,
       `Deleted product ${productId} by ${deletedBy}`
     );
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('app-storage-updated', {
+          detail: { key: STORAGE_KEYS.PRODUCTS, deletedId: productId, source: 'delete-product' },
+        })
+      );
+    }
   }
 
   // Stock Batches & Movements (Double-entry inventory ledger)
@@ -321,17 +749,21 @@ export class OfflineStorageManager {
         });
 
         // Add movement ledger entry
+        const noteDetail = (item.isPackagePurchase && item.packagesCount)
+          ? `Purchased ${item.packagesCount} ${item.packageUnitName || 'Cartons'} (${item.quantity} base units) from ${intake.supplierName} (${intake.invoiceNumber})`
+          : `Received from ${intake.supplierName} (${intake.invoiceNumber})`;
+
         movements.unshift({
           id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
           productId: prod.id,
-          productName: prod.name,
+          productName: item.productName || prod.name,
           batchId,
           type: 'PURCHASE_INTAKE',
           quantity: item.quantity,
           resultingStock: prod.currentStock,
           unitCostUSD: item.unitCostUSD,
           referenceId: intake.invoiceNumber,
-          notes: `Received from ${intake.supplierName} (${intake.invoiceNumber})`,
+          notes: noteDetail,
           performedBy: intake.receivedBy,
           timestamp: new Date().toISOString(),
         });
@@ -357,7 +789,8 @@ export class OfflineStorageManager {
     unitCostUSD: number,
     supplierName?: string,
     invoiceNumber?: string,
-    performedBy: string = 'Store Staff'
+    performedBy: string = 'Store Staff',
+    customNotes?: string
   ): { updatedStock: number; product: Product } | null {
     if (quantityToAdd <= 0) return null;
     const products = this.getProducts();
@@ -383,7 +816,7 @@ export class OfflineStorageManager {
       resultingStock: newStock,
       unitCostUSD: unitCostUSD > 0 ? unitCostUSD : prod.costPriceUSD,
       referenceId: invoiceNumber || `INTAKE-${Date.now().toString().slice(-4)}`,
-      notes: `Direct intake of +${quantityToAdd} units received by ${performedBy}${supplierName ? ` from ${supplierName}` : ''}`,
+      notes: customNotes || `Direct intake of +${quantityToAdd} units received by ${performedBy}${supplierName ? ` from ${supplierName}` : ''}`,
       performedBy,
       timestamp: new Date().toISOString(),
     });
@@ -478,11 +911,13 @@ export class OfflineStorageManager {
     sale.items.forEach((item) => {
       const prod = products.find((p) => p.id === item.productId);
       if (prod) {
-        prod.currentStock = Math.max(0, prod.currentStock - item.quantity);
+        // Multiplier: if item was sold as wholesale package, baseUnitQuantity will be e.g. 12 (1 pack of 12 = 12 single bottles)
+        const unitsDeducted = Math.round(item.quantity * (item.baseUnitQuantity || 1) * 100) / 100;
+        prod.currentStock = Math.max(0, prod.currentStock - unitsDeducted);
         prod.updatedAt = new Date().toISOString();
 
         // FIFO deduction from remaining batch stock
-        let needed = item.quantity;
+        let needed = unitsDeducted;
         const prodBatches = batches.filter((b) => b.productId === prod.id && b.quantityRemaining > 0);
         for (const b of prodBatches) {
           if (needed <= 0) break;
@@ -492,15 +927,17 @@ export class OfflineStorageManager {
         }
 
         // Add movement
+        const modeLabel = item.saleMode === 'WHOLESALE' ? ` [Wholesale ${item.unitLabel || 'Pack'}]` : '';
         movements.unshift({
           id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
           productId: prod.id,
-          productName: prod.name,
+          productName: `${prod.name}${modeLabel}`,
           type: 'SALE',
-          quantity: -item.quantity,
+          quantity: -unitsDeducted,
           resultingStock: prod.currentStock,
           unitCostUSD: item.unitCostUSD,
           referenceId: sale.receiptNumber,
+          notes: item.saleMode === 'WHOLESALE' ? `Sold ${item.quantity} ${item.unitLabel || 'Packs'} (${unitsDeducted} base units)` : undefined,
           performedBy: sale.cashierName,
           timestamp: sale.createdAt,
         });
@@ -571,7 +1008,28 @@ export class OfflineStorageManager {
 
   // Customers & Repayments
   static getCustomers(): Customer[] {
-    return loadItem<Customer[]>(STORAGE_KEYS.CUSTOMERS, INITIAL_CUSTOMERS);
+    const list = loadItem<Customer[]>(STORAGE_KEYS.CUSTOMERS, INITIAL_CUSTOMERS);
+    let modified = false;
+    INITIAL_CUSTOMERS.forEach((initCust) => {
+      const match = list.find((c) => c.id === initCust.id);
+      if (!match) {
+        list.push(initCust);
+        modified = true;
+      } else {
+        if (!match.tin && initCust.tin) {
+          match.tin = initCust.tin;
+          modified = true;
+        }
+        if (match.taxExempt === undefined && initCust.taxExempt !== undefined) {
+          match.taxExempt = initCust.taxExempt;
+          modified = true;
+        }
+      }
+    });
+    if (modified) {
+      saveItem(STORAGE_KEYS.CUSTOMERS, list);
+    }
+    return list;
   }
 
   static saveCustomer(cust: Customer): void {
@@ -620,17 +1078,77 @@ export class OfflineStorageManager {
     );
   }
 
-  // Suppliers
+  // Suppliers / Distributors
   static getSuppliers(): Supplier[] {
-    return loadItem<Supplier[]>(STORAGE_KEYS.SUPPLIERS, INITIAL_SUPPLIERS);
+    const list = loadItem<Supplier[]>(STORAGE_KEYS.SUPPLIERS, INITIAL_SUPPLIERS);
+    let modified = false;
+    INITIAL_SUPPLIERS.forEach((initSup) => {
+      const match = list.find((s) => s.id === initSup.id);
+      if (match && !match.tin && initSup.tin) {
+        match.tin = initSup.tin;
+        modified = true;
+      }
+    });
+    if (modified) {
+      saveItem(STORAGE_KEYS.SUPPLIERS, list);
+    }
+    return list;
   }
 
   static saveSupplier(supplier: Supplier): void {
     const list = this.getSuppliers();
     const idx = list.findIndex((s) => s.id === supplier.id);
-    if (idx >= 0) list[idx] = supplier;
-    else list.push(supplier);
+    const isNew = idx < 0;
+    if (isNew) {
+      list.push(supplier);
+    } else {
+      list[idx] = supplier;
+    }
     saveItem(STORAGE_KEYS.SUPPLIERS, list);
+    this.logAudit(
+      'manage_suppliers',
+      'SUPPLIER',
+      supplier.id,
+      `${isNew ? 'Added new' : 'Updated'} distributor/supplier: ${supplier.name} (${supplier.phone})`
+    );
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('app-storage-updated', {
+          detail: { key: STORAGE_KEYS.SUPPLIERS, source: 'save-supplier' },
+        })
+      );
+    }
+  }
+
+  static deleteSupplier(supplierId: string): boolean {
+    const list = this.getSuppliers();
+    const target = list.find((s) => s.id === supplierId);
+    if (!target) return false;
+
+    // Check if supplier is referenced in past intakes
+    const intakes = this.getIntakes();
+    const intakeCount = intakes.filter((it) => it.supplierId === supplierId).length;
+    if (intakeCount > 0) {
+      // Don't hard-delete if history exists, or warn user
+      return false;
+    }
+
+    const filtered = list.filter((s) => s.id !== supplierId);
+    saveItem(STORAGE_KEYS.SUPPLIERS, filtered);
+    this.logAudit(
+      'manage_suppliers',
+      'SUPPLIER',
+      supplierId,
+      `Deleted distributor ${target.name}`
+    );
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('app-storage-updated', {
+          detail: { key: STORAGE_KEYS.SUPPLIERS, source: 'delete-supplier' },
+        })
+      );
+    }
+    return true;
   }
 
   // Cash Sessions & Drawer Management
@@ -784,21 +1302,28 @@ export class OfflineStorageManager {
       settings: this.getSettings(),
       auditLogs: this.getAuditLogs(),
       users: this.getUsers(),
+      deletedIds: this.getDeletedIds(),
     };
   }
 
   static applyServerState(state: any, mode: 'replace' | 'merge' = 'merge'): void {
     if (!state || typeof state !== 'object') return;
 
+    // Track any deletions reported by server
+    if (Array.isArray(state.deletedIds)) {
+      state.deletedIds.forEach((id: string) => this.trackDeletedId(id));
+    }
+    const deletedIds = new Set(this.getDeletedIds());
+
     // Helper to merge lists by item id or unique barcode/name
     const mergeList = <T extends { id: string; barcode?: string; name?: string }>(currentList: T[], incomingList: T[]): T[] => {
-      if (mode === 'replace') return incomingList;
+      if (mode === 'replace') return incomingList.filter((i) => !deletedIds.has(i.id));
       const map = new Map<string, T>();
       currentList.forEach((item) => {
-        if (item && item.id) map.set(item.id, item);
+        if (item && item.id && !deletedIds.has(item.id)) map.set(item.id, item);
       });
       incomingList.forEach((item) => {
-        if (!item) return;
+        if (!item || (item.id && deletedIds.has(item.id))) return;
         if (item.id) {
           map.set(item.id, item);
         } else if (item.barcode) {
@@ -821,7 +1346,7 @@ export class OfflineStorageManager {
           }
         }
       });
-      return Array.from(map.values());
+      return Array.from(map.values()).filter((item) => !deletedIds.has(item.id));
     };
 
     if (Array.isArray(state.products) && state.products.length > 0) {
@@ -882,10 +1407,21 @@ export class OfflineStorageManager {
     }
     if (state.settings && typeof state.settings === 'object') {
       const current = this.getSettings();
-      saveItem(STORAGE_KEYS.SETTINGS, { ...current, ...state.settings });
-    }
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('app-storage-updated', { detail: { source: 'cloud-sync' } }));
+      const currentTime = current.updatedAt ? new Date(current.updatedAt).getTime() : 0;
+      const incomingTime = state.settings.updatedAt ? new Date(state.settings.updatedAt).getTime() : 0;
+      
+      // Only apply if server settings are strictly newer than local settings
+      if (incomingTime > currentTime || (!current.exchangeRate && state.settings.exchangeRate)) {
+        const rateChanged = typeof state.settings.exchangeRate === 'number' && state.settings.exchangeRate > 0 && state.settings.exchangeRate !== current.exchangeRate;
+        const mergedSettings: BusinessSettings = { ...current, ...state.settings };
+        saveItem(STORAGE_KEYS.SETTINGS, mergedSettings);
+        if (rateChanged) {
+          this.recalculateProductPrices(state.settings.exchangeRate);
+        }
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('app-storage-updated', { detail: { source: 'cloud-sync', settingsUpdated: true } }));
+        }
+      }
     }
   }
 }

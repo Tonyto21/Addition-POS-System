@@ -39,6 +39,8 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
   const [phone, setPhone] = useState('');
   const [address, setAddress] = useState('');
   const [creditLimitUSD, setCreditLimitUSD] = useState(100);
+  const [tin, setTin] = useState('');
+  const [taxExempt, setTaxExempt] = useState(false);
   const [notes, setNotes] = useState('');
 
   // Repayment Modal
@@ -65,6 +67,8 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
       creditLimitUSD: Number(creditLimitUSD) || 100,
       currentDebtUSD: 0,
       currentDebtLRD: 0,
+      tin: tin.trim() || undefined,
+      taxExempt: Boolean(taxExempt),
       notes: notes.trim(),
       createdAt: new Date().toISOString(),
     };
@@ -77,6 +81,8 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
     setName('');
     setPhone('');
     setAddress('');
+    setTin('');
+    setTaxExempt(false);
     setNotes('');
     onRefresh();
   };
@@ -212,11 +218,23 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
                   <div className="flex items-start justify-between">
                     <div>
                       <h4 className="text-sm font-extrabold text-stone-900">{cust.name}</h4>
-                      {cust.phone && (
-                        <div className="text-xs text-stone-500 flex items-center gap-1 mt-0.5 font-mono">
-                          <Phone className="w-3 h-3 text-stone-400" /> {cust.phone}
-                        </div>
-                      )}
+                      <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
+                        {cust.phone && (
+                          <div className="text-xs text-stone-500 flex items-center gap-1 font-mono">
+                            <Phone className="w-3 h-3 text-stone-400" /> {cust.phone}
+                          </div>
+                        )}
+                        {cust.tin && (
+                          <span className="text-[10px] font-mono bg-stone-100 text-stone-600 px-1.5 py-0.2 rounded border border-stone-200">
+                            TIN: {cust.tin}
+                          </span>
+                        )}
+                        {cust.taxExempt && (
+                          <span className="text-[10px] font-bold bg-emerald-100 text-emerald-800 px-1.5 py-0.2 rounded border border-emerald-300">
+                            TAX EXEMPT
+                          </span>
+                        )}
+                      </div>
                     </div>
 
                     <span
@@ -348,6 +366,32 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
                   onChange={(e) => setCreditLimitUSD(parseFloat(e.target.value) || 0)}
                   className="w-full bg-stone-50 border border-stone-300 rounded-xl px-3 py-2 text-stone-900 font-mono focus:outline-none focus:bg-white focus:border-blue-600"
                 />
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-stone-700 font-bold">Taxpayer Identification Number (TIN)</label>
+                <input
+                  type="text"
+                  value={tin}
+                  onChange={(e) => setTin(e.target.value)}
+                  placeholder="e.g. CUST-TIN-88910"
+                  className="w-full bg-stone-50 border border-stone-300 rounded-xl px-3 py-2 text-stone-900 font-mono focus:outline-none focus:bg-white focus:border-blue-600"
+                />
+              </div>
+
+              <div className="pt-1">
+                <label className="flex items-center gap-2 cursor-pointer font-bold text-stone-800">
+                  <input
+                    type="checkbox"
+                    checked={taxExempt}
+                    onChange={(e) => setTaxExempt(e.target.checked)}
+                    className="w-4 h-4 rounded border-stone-300 text-blue-600 focus:ring-0"
+                  />
+                  <span>Tax-Exempt Entity (e.g. NGO, Diplomatic, Govt)</span>
+                </label>
+                <p className="text-[10px] text-stone-500 pl-6 mt-0.5">
+                  Flags this customer as exempt. In POS, cashiers can deliberately activate the tax exemption for their orders.
+                </p>
               </div>
 
               <div className="pt-2 flex justify-end gap-2">

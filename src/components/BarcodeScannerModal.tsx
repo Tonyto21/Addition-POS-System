@@ -11,6 +11,7 @@ import {
   Smartphone,
   Monitor,
   Zap,
+  Barcode,
 } from 'lucide-react';
 import { playSupermarketBeep, playBeep } from '../utils/audio';
 import { decodeBarcodeFromImageFile, decodeBarcodeFromVideoElement } from '../utils/barcodeScanner';
@@ -19,19 +20,23 @@ import { DeviceHelper } from '../utils/device';
 interface BarcodeScannerModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onScan: (barcode: string) => void;
+  onScan?: (barcode: string) => void;
+  onDetected?: (barcode: string) => void;
   title?: string;
   continuous?: boolean;
   allowPhotoUpload?: boolean;
+  initialValue?: string;
 }
 
 export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
   isOpen,
   onClose,
   onScan,
+  onDetected,
   title = 'Barcode Scanner',
   continuous = true,
   allowPhotoUpload = true,
+  initialValue = '',
 }) => {
   // Determine if running on mobile device or desktop web
   const isMobile = DeviceHelper.isMobileDevice();
@@ -56,13 +61,22 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
 
   const [hasCamera, setHasCamera] = useState(true);
   const [cameraError, setCameraError] = useState<string | null>(null);
-  const [manualCode, setManualCode] = useState('');
-  const [lastScanned, setLastScanned] = useState<string | null>(null);
+  const [manualCode, setManualCode] = useState(initialValue);
+  const [lastScanned, setLastScanned] = useState<string | null>(initialValue || null);
   const [isProcessingPhoto, setIsProcessingPhoto] = useState(false);
   const [photoError, setPhotoError] = useState<string | null>(null);
   const [uploadedPreview, setUploadedPreview] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const manualInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Sync initialValue if provided
+  useEffect(() => {
+    if (isOpen && initialValue) {
+      setManualCode(initialValue);
+      setLastScanned(initialValue);
+    }
+  }, [isOpen, initialValue]);
 
   // When modal opens or mode changes:
   useEffect(() => {
@@ -173,18 +187,53 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
     }
   };
 
-  // Handle successful barcode recognition (from either camera OR photo upload)
+  // Resume camera scanning loop if user wants to scan a different barcode
+  const handleResumeScan = () => {
+    setManualCode('');
+    setLastScanned(null);
+    setPhotoError(null);
+    if (activeMode === 'camera') {
+      isScanningRef.current = true;
+      startScanLoop();
+    }
+  };
+
+  // Handle successful barcode recognition (from camera, photo upload, or catalog preset)
   const handleSuccessfulScan = (code: string) => {
-    // Subtle audio feedback
+    const clean = code.trim();
+    if (!clean) return;
+
+    // 1. Play supermarket confirmation beep
     playSupermarketBeep();
 
-    setLastScanned(code);
-    onScan(code);
+    // 2. Pause the live camera frame analysis loop so it doesn't repeatedly trigger
+    isScanningRef.current = false;
 
-    if (!continuous) {
-      stopCamera();
-      onClose();
-    }
+    // 3. Autofill the scanned number into the manual code state and lastScanned
+    setLastScanned(clean);
+    setManualCode(clean);
+
+    // 4. Focus and highlight the input field so user can simply press Enter on keyboard/keypad to conclude
+    setTimeout(() => {
+      if (manualInputRef.current) {
+        manualInputRef.current.focus();
+        manualInputRef.current.select();
+      }
+    }, 80);
+
+    // 5. Notify preview listener if present without closing modal
+    onDetected?.(clean);
+  };
+
+  // Conclude the scan session with the current or passed code (triggered by Enter key or button)
+  const handleConclude = (codeToUse?: string) => {
+    const clean = (codeToUse || manualCode || lastScanned || '').trim();
+    if (!clean) return;
+    playBeep('success');
+    stopCamera();
+    onScan?.(clean);
+    onDetected?.(clean);
+    onClose();
   };
 
   // Handle uploaded photo decoding
@@ -218,9 +267,7 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
   const handleManualSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!manualCode.trim()) return;
-    const code = manualCode.trim();
-    handleSuccessfulScan(code);
-    setManualCode('');
+    handleConclude(manualCode.trim());
   };
 
   // Quick preset test barcodes from store catalog
@@ -403,30 +450,73 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
           )}
 
           {/* Success Banner when code is detected */}
-          {lastScanned && (
-            <div className="absolute bottom-2 left-1/2 -translate-x-1/2 bg-emerald-950/95 border border-emerald-600 text-emerald-300 text-xs px-3.5 py-1.5 rounded-full shadow-lg flex items-center gap-1.5">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-              <span>Scanned: <strong className="font-mono text-white">{lastScanned}</strong></span>
+          {manualCode && (
+            <div className="absolute bottom-3 left-1/2 -translate-x-1/2 w-[94%] max-w-md bg-stone-950/95 border-2 border-emerald-500 text-white p-3 rounded-2xl shadow-2xl flex items-center justify-between gap-3 animate-fade-in backdrop-blur-md z-20">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0">
+                  <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-[10px] text-emerald-400 font-extrabold uppercase tracking-wider flex items-center gap-1">
+                    <span>Barcode Recognized & Autofilled:</span>
+                  </div>
+                  <div className="font-mono font-black text-white text-sm sm:text-base truncate">
+                    {manualCode}
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleResumeScan}
+                  className="px-2.5 py-1.5 bg-stone-800 hover:bg-stone-700 text-stone-300 font-bold text-[11px] rounded-xl border border-stone-700 transition"
+                  title="Discard and scan a different barcode"
+                >
+                  Scan Again
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleConclude(manualCode)}
+                  className="px-3.5 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black text-xs rounded-xl shadow transition flex items-center gap-1 active:scale-95"
+                  title="Conclude barcode entering and apply"
+                >
+                  <span>Conclude ↵</span>
+                </button>
+              </div>
             </div>
           )}
         </div>
 
         {/* Manual Barcode Entry + Preset Test Barcodes */}
-        <div className="p-4 bg-stone-800/90 border-t border-stone-700 space-y-3">
-          <form onSubmit={handleManualSubmit} className="flex gap-2">
-            <input
-              type="text"
-              value={manualCode}
-              onChange={(e) => setManualCode(e.target.value)}
-              placeholder="Or enter barcode numbers manually (e.g. 070001000123)..."
-              className="flex-1 bg-stone-900 border border-stone-700 rounded-xl px-3 py-2 text-xs text-white placeholder-stone-500 focus:outline-none focus:border-blue-500"
-            />
-            <button
-              type="submit"
-              className="px-4 py-2 bg-stone-700 hover:bg-stone-600 text-white text-xs font-bold rounded-xl transition"
-            >
-              Enter
-            </button>
+        <div className="p-4 bg-stone-850 border-t border-stone-700/80 space-y-3">
+          <form onSubmit={handleManualSubmit} className="space-y-1.5">
+            <div className="flex items-center justify-between text-xs">
+              <label className="text-stone-300 font-bold flex items-center gap-1.5 text-[11px]">
+                <Barcode className="w-3.5 h-3.5 text-blue-400" />
+                <span>Autofilled Barcode Number:</span>
+              </label>
+              <span className="text-[10px] text-stone-400">
+                Press Enter on keyboard or click button
+              </span>
+            </div>
+            <div className="flex gap-2">
+              <input
+                ref={manualInputRef}
+                type="text"
+                value={manualCode}
+                onChange={(e) => setManualCode(e.target.value)}
+                placeholder="Scan or enter barcode digits..."
+                className="flex-1 bg-stone-900 border-2 border-stone-600 focus:border-emerald-500 rounded-xl px-3.5 py-2.5 text-sm font-mono font-bold text-white placeholder-stone-500 focus:outline-none focus:bg-stone-950 transition"
+              />
+              <button
+                type="submit"
+                disabled={!manualCode.trim()}
+                className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:bg-stone-800 disabled:text-stone-500 text-white text-xs font-black rounded-xl transition flex items-center gap-1.5 shadow-sm active:scale-95 shrink-0"
+              >
+                <span>Enter & Conclude</span>
+                <span className="font-mono text-xs opacity-80">↵</span>
+              </button>
+            </div>
           </form>
 
           {/* Quick Barcode Simulator Buttons */}

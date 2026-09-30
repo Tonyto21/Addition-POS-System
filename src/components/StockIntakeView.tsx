@@ -14,12 +14,14 @@ import {
 import { BusinessSettings, Product, StockIntakeItem, StockIntakeTransaction, Supplier, User } from '../types';
 import { OfflineStorageManager } from '../utils/storage';
 import { BarcodeScannerModal } from './BarcodeScannerModal';
+import { DistributorManagerModal } from './DistributorManagerModal';
 
 interface StockIntakeViewProps {
   settings: BusinessSettings;
   activeUser: User;
   onFinished: () => void;
   onRefresh?: () => void;
+  initialSupplierId?: string;
 }
 
 export const StockIntakeView: React.FC<StockIntakeViewProps> = ({
@@ -27,19 +29,24 @@ export const StockIntakeView: React.FC<StockIntakeViewProps> = ({
   activeUser,
   onFinished,
   onRefresh,
+  initialSupplierId,
 }) => {
-  const [suppliers] = useState<Supplier[]>(() => OfflineStorageManager.getSuppliers());
+  const [suppliers, setSuppliers] = useState<Supplier[]>(() => OfflineStorageManager.getSuppliers());
   const [products, setProducts] = useState<Product[]>(() => OfflineStorageManager.getProducts());
+  const [distributorModalOpen, setDistributorModalOpen] = useState(false);
 
   useEffect(() => {
     const handleUpdate = () => {
       setProducts(OfflineStorageManager.getProducts());
+      setSuppliers(OfflineStorageManager.getSuppliers());
     };
     window.addEventListener('app-storage-updated', handleUpdate);
     return () => window.removeEventListener('app-storage-updated', handleUpdate);
   }, []);
 
-  const [selectedSupplierId, setSelectedSupplierId] = useState<string>(suppliers[0]?.id || '');
+  const [selectedSupplierId, setSelectedSupplierId] = useState<string>(
+    initialSupplierId || suppliers[0]?.id || ''
+  );
   const [invoiceNumber, setInvoiceNumber] = useState<string>(`INV-${Date.now().toString().slice(-4)}`);
   const [dateReceived, setDateReceived] = useState<string>(new Date().toISOString().slice(0, 10));
   const [notes, setNotes] = useState<string>('');
@@ -48,6 +55,7 @@ export const StockIntakeView: React.FC<StockIntakeViewProps> = ({
 
   // Add Item form states
   const [selectedProductId, setSelectedProductId] = useState<string>(products[0]?.id || '');
+  const [intakeMode, setIntakeMode] = useState<'BASE' | 'PACKAGE'>('BASE');
   const [quantity, setQuantity] = useState<number>(10);
   const [unitCostUSD, setUnitCostUSD] = useState<number>(5.0);
   const [sellingPriceUSD, setSellingPriceUSD] = useState<number>(6.5);
@@ -57,6 +65,42 @@ export const StockIntakeView: React.FC<StockIntakeViewProps> = ({
   const [scannerOpen, setScannerOpen] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
 
+  const activeProduct = products.find((p) => p.id === selectedProductId);
+  const units = OfflineStorageManager.getUnits();
+  const activeUnit = units.find((u) => u.id === activeProduct?.unitId);
+  const baseSymbol = activeUnit?.symbol || activeUnit?.name || 'Bottles';
+
+  // Flexible package options: custom packageTiers or primary package unit
+  const packageOptions = React.useMemo(() => {
+    if (!activeProduct) return [];
+    if (activeProduct.packageTiers && activeProduct.packageTiers.length > 0) {
+      return activeProduct.packageTiers;
+    }
+    if (activeProduct.hasPackageUnit && activeProduct.packageMultiplier && activeProduct.packageMultiplier > 1) {
+      return [
+        {
+          id: 'primary',
+          name: activeProduct.packageUnitName || 'Carton',
+          multiplier: activeProduct.packageMultiplier,
+          costUSD: activeProduct.packageCostUSD,
+          packagePriceUSD: activeProduct.packagePriceUSD,
+        },
+      ];
+    }
+    return [];
+  }, [activeProduct]);
+
+  const [selectedTierId, setSelectedTierId] = useState<string>('');
+  const activeSelectedTier = packageOptions.find((t) => t.id === selectedTierId) || packageOptions[0] || null;
+
+  const hasPackage = packageOptions.length > 0;
+  const multiplier = intakeMode === 'PACKAGE' ? (activeSelectedTier?.multiplier || 1) : 1;
+  const selectedPkgName = activeSelectedTier?.name || activeProduct?.packageUnitName || 'Carton';
+
+  // Effective single units and unit cost
+  const effectiveBaseUnits = intakeMode === 'PACKAGE' ? Math.round(quantity * multiplier * 100) / 100 : quantity;
+  const effectiveUnitCostUSD = intakeMode === 'PACKAGE' ? (unitCostUSD / multiplier) : unitCostUSD;
+
   const totalCostUSD = items.reduce((sum, it) => sum + it.subtotalCostUSD, 0);
   const totalCostLRD = Math.round(totalCostUSD * settings.exchangeRate);
 
@@ -64,8 +108,19 @@ export const StockIntakeView: React.FC<StockIntakeViewProps> = ({
     setSelectedProductId(prodId);
     const prod = products.find((p) => p.id === prodId);
     if (prod) {
-      setUnitCostUSD(prod.costPriceUSD);
-      setSellingPriceUSD(prod.sellingPriceUSD);
+      const hasPkg = (prod.packageTiers && prod.packageTiers.length > 0) || Boolean(prod.hasPackageUnit);
+      if (hasPkg) {
+        setIntakeMode('PACKAGE');
+        const defaultTier = prod.packageTiers?.[0];
+        const mult = defaultTier ? defaultTier.multiplier : (prod.packageMultiplier || 1);
+        const cost = defaultTier?.packageCostUSD || prod.packageCostUSD || (prod.costPriceUSD * mult);
+        setUnitCostUSD(cost > 0 ? cost : prod.costPriceUSD * mult);
+        setSellingPriceUSD(prod.packagePriceUSD || (prod.sellingPriceUSD * mult));
+      } else {
+        setIntakeMode('BASE');
+        setUnitCostUSD(prod.costPriceUSD);
+        setSellingPriceUSD(prod.sellingPriceUSD);
+      }
     }
   };
 
@@ -75,20 +130,25 @@ export const StockIntakeView: React.FC<StockIntakeViewProps> = ({
     if (!prod || quantity <= 0) return;
 
     const supplier = suppliers.find((s) => s.id === selectedSupplierId);
+    const customNote = intakeMode === 'PACKAGE'
+      ? `Purchased ${quantity} ${selectedPkgName} (${effectiveBaseUnits} ${baseSymbol}) from ${supplier?.name || 'Distributor'}`
+      : `Received +${effectiveBaseUnits} ${baseSymbol} from ${supplier?.name || 'Distributor'}`;
+
     const result = OfflineStorageManager.recordSingleProductIntake(
       prod.id,
-      quantity,
-      unitCostUSD,
+      effectiveBaseUnits,
+      effectiveUnitCostUSD,
       supplier?.name,
       invoiceNumber.trim() || undefined,
-      activeUser.name
+      activeUser.name,
+      customNote
     );
 
     if (result) {
-      setFeedback(`✅ Added +${quantity} units to ${prod.name}! New Current Stock: ${result.updatedStock}`);
+      setFeedback(`✅ Added +${effectiveBaseUnits} ${baseSymbol} to ${prod.name}! (${quantity} ${selectedPkgName} = ${effectiveBaseUnits} ${baseSymbol}). New Stock: ${result.updatedStock} ${baseSymbol}`);
       setProducts(OfflineStorageManager.getProducts());
       if (onRefresh) onRefresh();
-      setTimeout(() => setFeedback(null), 4000);
+      setTimeout(() => setFeedback(null), 4500);
     }
   };
 
@@ -100,22 +160,29 @@ export const StockIntakeView: React.FC<StockIntakeViewProps> = ({
     const subtotal = quantity * unitCostUSD;
     const newItem: StockIntakeItem = {
       productId: prod.id,
-      productName: prod.name,
-      quantity,
-      unitCostUSD,
-      sellingPriceUSD,
-      sellingPriceLRD: Math.round(sellingPriceUSD * settings.exchangeRate),
+      productName: intakeMode === 'PACKAGE'
+        ? `${prod.name} [${quantity} × ${selectedPkgName}]`
+        : prod.name,
+      quantity: effectiveBaseUnits, // logs single base units into stock
+      unitCostUSD: effectiveUnitCostUSD,
+      sellingPriceUSD: prod.sellingPriceUSD,
+      sellingPriceLRD: Math.round(prod.sellingPriceUSD * settings.exchangeRate),
       batchNumber: batchNumber.trim() || undefined,
       expiryDate: expiryDate || undefined,
       subtotalCostUSD: subtotal,
+      isPackagePurchase: intakeMode === 'PACKAGE',
+      packageUnitName: selectedPkgName,
+      packageMultiplier: multiplier,
+      packagesCount: intakeMode === 'PACKAGE' ? quantity : undefined,
+      costPerPackageUSD: intakeMode === 'PACKAGE' ? unitCostUSD : undefined,
     };
 
     setItems([...items, newItem]);
-    setFeedback(`Added ${prod.name} (${quantity} units) to intake invoice manifest`);
-    setTimeout(() => setFeedback(null), 2500);
+    setFeedback(`Added ${prod.name} (${quantity} ${selectedPkgName} = ${effectiveBaseUnits} ${baseSymbol}) to invoice manifest`);
+    setTimeout(() => setFeedback(null), 3000);
 
     // reset fields
-    setQuantity(1);
+    setQuantity(10);
   };
 
   const handleRemoveItem = (index: number) => {
@@ -177,18 +244,38 @@ export const StockIntakeView: React.FC<StockIntakeViewProps> = ({
             </h3>
 
             <div className="space-y-1">
-              <label className="text-slate-400">Supplier</label>
-              <select
-                value={selectedSupplierId}
-                onChange={(e) => setSelectedSupplierId(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-white focus:outline-none focus:border-blue-500"
-              >
-                {suppliers.map((sup) => (
-                  <option key={sup.id} value={sup.id}>
-                    {sup.name}
-                  </option>
-                ))}
-              </select>
+              <div className="flex items-center justify-between">
+                <label className="text-slate-400">Supplier / Distributor</label>
+                <button
+                  type="button"
+                  onClick={() => setDistributorModalOpen(true)}
+                  className="text-[11px] text-blue-400 hover:text-blue-300 font-bold flex items-center gap-1 hover:underline"
+                >
+                  <Plus className="w-3 h-3" />
+                  <span>Manage Distributors</span>
+                </button>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <select
+                  value={selectedSupplierId}
+                  onChange={(e) => setSelectedSupplierId(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-white focus:outline-none focus:border-blue-500"
+                >
+                  {suppliers.map((sup) => (
+                    <option key={sup.id} value={sup.id}>
+                      {sup.name} {sup.phone ? `(${sup.phone})` : ''}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => setDistributorModalOpen(true)}
+                  className="px-2.5 py-1.5 bg-blue-600/30 hover:bg-blue-600/50 border border-blue-500/50 text-blue-300 hover:text-white rounded shrink-0 transition"
+                  title="Add or view distributor info"
+                >
+                  <Building className="w-3.5 h-3.5" />
+                </button>
+              </div>
             </div>
 
             <div className="grid grid-cols-2 gap-2">
@@ -248,18 +335,119 @@ export const StockIntakeView: React.FC<StockIntakeViewProps> = ({
               >
                 {products.map((p) => (
                   <option key={p.id} value={p.id}>
-                    {p.name} (Stock: {p.currentStock})
+                    {p.name} (Stock: {p.currentStock}) {p.hasPackageUnit ? `• Has ${p.packageUnitName}` : ''}
                   </option>
                 ))}
               </select>
             </div>
 
+            {/* Receiving Mode Toggle if product has Wholesale Package Unit */}
+            {hasPackage && (
+              <div className="p-3 bg-slate-950 rounded-xl border border-blue-900/60 space-y-2.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-slate-400 font-bold">Purchase Mode:</span>
+                  <span className="font-bold text-amber-400">
+                    1 {selectedPkgName} = {multiplier} {baseSymbol}
+                  </span>
+                </div>
+
+                {packageOptions.length > 1 && (
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-slate-400 uppercase tracking-wider font-bold">Select Packaging Size</label>
+                    <select
+                      value={selectedTierId || packageOptions[0]?.id}
+                      onChange={(e) => {
+                        setSelectedTierId(e.target.value);
+                        const tier = packageOptions.find((t) => t.id === e.target.value);
+                        if (tier && activeProduct) {
+                          const cost = tier.costUSD || tier.packagePriceUSD || (activeProduct.costPriceUSD * tier.multiplier);
+                          setUnitCostUSD(cost);
+                        }
+                      }}
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white font-bold text-xs"
+                    >
+                      {packageOptions.map((opt) => (
+                        <option key={opt.id} value={opt.id}>
+                          {opt.name} ({opt.multiplier} {baseSymbol})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIntakeMode('BASE');
+                      if (activeProduct) {
+                        setUnitCostUSD(activeProduct.costPriceUSD);
+                      }
+                    }}
+                    className={`py-1.5 px-2 rounded-lg font-bold text-xs transition ${
+                      intakeMode === 'BASE'
+                        ? 'bg-blue-600 text-white shadow'
+                        : 'bg-slate-900 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Loose / Singles ({baseSymbol})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIntakeMode('PACKAGE');
+                      if (activeProduct) {
+                        const tierCost = activeSelectedTier?.costUSD || activeProduct.packageCostUSD || (activeProduct.costPriceUSD * multiplier);
+                        setUnitCostUSD(tierCost);
+                      }
+                    }}
+                    className={`py-1.5 px-2 rounded-lg font-bold text-xs transition ${
+                      intakeMode === 'PACKAGE'
+                        ? 'bg-amber-600 text-white shadow'
+                        : 'bg-slate-900 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    By {selectedPkgName} (&times;{multiplier})
+                  </button>
+                </div>
+
+                {/* Explicit Base-Unit Breakdown Card */}
+                <div className="p-2.5 bg-slate-900/90 rounded-lg border border-slate-800 text-[11px] space-y-1 font-mono">
+                  <div className="flex justify-between text-slate-300">
+                    <span>Quantity purchased:</span>
+                    <strong className="text-white">{quantity} {intakeMode === 'PACKAGE' ? selectedPkgName : baseSymbol}</strong>
+                  </div>
+                  {intakeMode === 'PACKAGE' && (
+                    <>
+                      <div className="flex justify-between text-slate-300">
+                        <span>Purchase unit:</span>
+                        <strong className="text-amber-400">{selectedPkgName}</strong>
+                      </div>
+                      <div className="flex justify-between text-slate-300">
+                        <span>Units per {selectedPkgName.toLowerCase()}:</span>
+                        <strong className="text-white">{multiplier} {baseSymbol}</strong>
+                      </div>
+                      <div className="flex justify-between text-emerald-400 pt-1 border-t border-slate-800 font-bold">
+                        <span>Total base units received:</span>
+                        <span>{effectiveBaseUnits} {baseSymbol}</span>
+                      </div>
+                      <div className="text-[10px] text-amber-300/90 text-right pt-0.5">
+                        Equivalent: {effectiveBaseUnits} {baseSymbol} = {quantity} {selectedPkgName}
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+
             <div className="grid grid-cols-2 gap-2">
               <div className="space-y-1">
-                <label className="text-slate-400">Intake Quantity *</label>
+                <label className="text-slate-400">
+                  {intakeMode === 'PACKAGE' ? `Quantity (${activeProduct?.packageUnitName || 'Packs'}) *` : 'Intake Quantity *'}
+                </label>
                 <input
                   type="number"
-                  step="0.1"
+                  step={intakeMode === 'PACKAGE' ? '1' : '0.1'}
                   min="0.1"
                   required
                   value={quantity}
@@ -269,7 +457,9 @@ export const StockIntakeView: React.FC<StockIntakeViewProps> = ({
               </div>
 
               <div className="space-y-1">
-                <label className="text-slate-400">Unit Cost (USD) *</label>
+                <label className="text-slate-400">
+                  {intakeMode === 'PACKAGE' ? 'Cost Per Pack (USD) *' : 'Unit Cost (USD) *'}
+                </label>
                 <input
                   type="number"
                   step="0.01"
@@ -283,35 +473,25 @@ export const StockIntakeView: React.FC<StockIntakeViewProps> = ({
 
             <div className="grid grid-cols-2 gap-2">
               <div className="space-y-1">
-                <label className="text-slate-400">Selling Price (USD)</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={sellingPriceUSD}
-                  onChange={(e) => setSellingPriceUSD(parseFloat(e.target.value) || 0)}
-                  className="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-white font-mono"
-                />
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-slate-400">Batch / Lot #</label>
+                <label className="text-slate-400">Batch / Lot # (optional)</label>
                 <input
                   type="text"
+                  placeholder="e.g. BATCH-01"
                   value={batchNumber}
                   onChange={(e) => setBatchNumber(e.target.value)}
                   className="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-white font-mono"
                 />
               </div>
-            </div>
 
-            <div className="space-y-1">
-              <label className="text-slate-400">Expiry Date (optional)</label>
-              <input
-                type="date"
-                value={expiryDate}
-                onChange={(e) => setExpiryDate(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-white"
-              />
+              <div className="space-y-1">
+                <label className="text-slate-400">Expiry Date (optional)</label>
+                <input
+                  type="date"
+                  value={expiryDate}
+                  onChange={(e) => setExpiryDate(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-white"
+                />
+              </div>
             </div>
 
             {feedback && (
@@ -437,6 +617,19 @@ export const StockIntakeView: React.FC<StockIntakeViewProps> = ({
           }
         }}
         title="Scan Product to Intake"
+      />
+
+      <DistributorManagerModal
+        isOpen={distributorModalOpen}
+        onClose={() => setDistributorModalOpen(false)}
+        suppliers={suppliers}
+        onSuppliersUpdated={() => {
+          const updated = OfflineStorageManager.getSuppliers();
+          setSuppliers(updated);
+        }}
+        onSupplierSelected={(supId) => {
+          setSelectedSupplierId(supId);
+        }}
       />
     </div>
   );

@@ -12,6 +12,7 @@ import {
   Monitor,
   Check,
   Zap,
+  FileCode,
 } from 'lucide-react';
 import { CloudSyncManager, SyncStatus } from '../utils/cloudSync';
 import { OfflineStorageManager } from '../utils/storage';
@@ -246,7 +247,7 @@ export const CloudSyncView: React.FC<CloudSyncViewProps> = ({
       )}
 
       {/* Backup & Direct File Import Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {/* Card 1: Download Backup */}
         <div className="p-4 bg-stone-50 border border-stone-200 rounded-2xl flex flex-col justify-between space-y-3">
           <div className="space-y-1">
@@ -298,6 +299,28 @@ export const CloudSyncView: React.FC<CloudSyncViewProps> = ({
               <span>Select Backup File to Restore</span>
             </button>
           </div>
+        </div>
+
+        {/* Card 3: Download Complete Source Code (.ZIP) */}
+        <div className="p-4 bg-stone-50 border border-stone-200 rounded-2xl flex flex-col justify-between space-y-3">
+          <div className="space-y-1">
+            <div className="font-extrabold text-stone-900 text-xs sm:text-sm flex items-center gap-2">
+              <FileCode className="w-4 h-4 text-purple-600" />
+              <span>Source Code Archive (.ZIP)</span>
+            </div>
+            <p className="text-stone-500 text-xs leading-relaxed">
+              Download the entire project source code (React, TypeScript, Tailwind, Express) in a clean ZIP package ready for VS Code or deployment.
+            </p>
+          </div>
+
+          <a
+            href="/api/download-source-zip"
+            download="addition-business-centre-source.zip"
+            className="w-full py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition shadow-2xs active:scale-98 text-center"
+          >
+            <Download className="w-4 h-4 text-white" />
+            <span>Download Source (.zip)</span>
+          </a>
         </div>
       </div>
 

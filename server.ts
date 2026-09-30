@@ -43,6 +43,7 @@ interface ServerDbState {
   settings: any | null;
   auditLogs: any[];
   users: any[];
+  deletedIds: string[];
   lastUpdated: string;
 }
 
@@ -70,6 +71,7 @@ function loadServerDb(): ServerDbState {
         settings: parsed.settings || null,
         auditLogs: Array.isArray(parsed.auditLogs) ? parsed.auditLogs : [],
         users: Array.isArray(parsed.users) ? parsed.users : [],
+        deletedIds: Array.isArray(parsed.deletedIds) ? parsed.deletedIds : [],
         lastUpdated: parsed.lastUpdated || new Date().toISOString(),
       };
     }
@@ -92,6 +94,7 @@ function loadServerDb(): ServerDbState {
     settings: null,
     auditLogs: [],
     users: [],
+    deletedIds: [],
     lastUpdated: new Date().toISOString(),
   };
 }
@@ -153,6 +156,18 @@ app.get('/api/health', (req: Request, res: Response) => {
   });
 });
 
+// Endpoint to download the clean project source code in a ZIP file
+app.get('/api/download-source-zip', (req: Request, res: Response) => {
+  const zipPath = path.join(process.cwd(), 'public', 'addition-business-centre-source.zip');
+  if (fs.existsSync(zipPath)) {
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="addition-business-centre-source.zip"');
+    const fileStream = fs.createReadStream(zipPath);
+    return fileStream.pipe(res);
+  }
+  return res.status(404).json({ error: 'Source zip file not found' });
+});
+
 // Real-Time Cross-Device Sync Endpoints
 app.get('/api/sync/state', (req: Request, res: Response) => {
   res.json({
@@ -169,21 +184,42 @@ app.post('/api/sync/bidirectional', (req: Request, res: Response) => {
       return res.status(400).json({ error: 'clientData object expected' });
     }
 
+    // Process deleted IDs from client and purge them across server collections
+    if (Array.isArray(clientData.deletedIds)) {
+      const currentDeleted = new Set(serverDb.deletedIds || []);
+      clientData.deletedIds.forEach((id: string) => currentDeleted.add(id));
+      serverDb.deletedIds = Array.from(currentDeleted);
+    }
+    const deletedSet = new Set(serverDb.deletedIds || []);
+
+    // Purge any deleted items before merging
+    serverDb.products = serverDb.products.filter((p) => !deletedSet.has(p.id));
+    serverDb.categories = serverDb.categories.filter((c) => !deletedSet.has(c.id));
+    serverDb.units = serverDb.units.filter((u) => !deletedSet.has(u.id));
+    serverDb.suppliers = serverDb.suppliers.filter((s) => !deletedSet.has(s.id));
+    serverDb.customers = serverDb.customers.filter((c) => !deletedSet.has(c.id));
+
+    // Filter incoming items against deleted tombstones
+    const sanitizeIncoming = <T extends { id?: string }>(list: any[]): T[] => {
+      if (!Array.isArray(list)) return [];
+      return list.filter((item) => item && item.id && !deletedSet.has(item.id));
+    };
+
     // Merge each collection
     if (Array.isArray(clientData.products)) {
-      serverDb.products = mergeCollection(serverDb.products, clientData.products);
+      serverDb.products = mergeCollection(serverDb.products, sanitizeIncoming(clientData.products));
     }
     if (Array.isArray(clientData.categories)) {
-      serverDb.categories = mergeCollection(serverDb.categories, clientData.categories);
+      serverDb.categories = mergeCollection(serverDb.categories, sanitizeIncoming(clientData.categories));
     }
     if (Array.isArray(clientData.units)) {
-      serverDb.units = mergeCollection(serverDb.units, clientData.units);
+      serverDb.units = mergeCollection(serverDb.units, sanitizeIncoming(clientData.units));
     }
     if (Array.isArray(clientData.suppliers)) {
-      serverDb.suppliers = mergeCollection(serverDb.suppliers, clientData.suppliers);
+      serverDb.suppliers = mergeCollection(serverDb.suppliers, sanitizeIncoming(clientData.suppliers));
     }
     if (Array.isArray(clientData.customers)) {
-      serverDb.customers = mergeCollection(serverDb.customers, clientData.customers);
+      serverDb.customers = mergeCollection(serverDb.customers, sanitizeIncoming(clientData.customers));
     }
     if (Array.isArray(clientData.sales)) {
       serverDb.sales = mergeCollection(serverDb.sales, clientData.sales);
@@ -213,7 +249,12 @@ app.post('/api/sync/bidirectional', (req: Request, res: Response) => {
       serverDb.users = mergeCollection(serverDb.users, clientData.users);
     }
     if (clientData.settings && typeof clientData.settings === 'object') {
-      serverDb.settings = { ...serverDb.settings, ...clientData.settings };
+      const currentServerSettings = serverDb.settings || {};
+      const serverTime = currentServerSettings.updatedAt ? new Date(currentServerSettings.updatedAt).getTime() : 0;
+      const clientTime = clientData.settings.updatedAt ? new Date(clientData.settings.updatedAt).getTime() : 0;
+      if (clientTime >= serverTime || !currentServerSettings.exchangeRate) {
+        serverDb.settings = { ...currentServerSettings, ...clientData.settings };
+      }
     }
 
     // Persist to disk

@@ -11,8 +11,11 @@ import {
   Sparkles,
   Maximize2,
   SwitchCamera,
+  Crop,
+  Smartphone,
 } from 'lucide-react';
 import { DeviceHelper } from '../utils/device';
+import { ImageCropModal } from './ImageCropModal';
 
 interface ProductPhotoCaptureProps {
   imageUrl?: string;
@@ -35,6 +38,10 @@ export const ProductPhotoCapture: React.FC<ProductPhotoCaptureProps> = ({
 
   // Snapshot Review within camera modal
   const [capturedSnapshot, setCapturedSnapshot] = useState<string | null>(null);
+
+  // Image Cropping Modal State
+  const [isCropModalOpen, setIsCropModalOpen] = useState(false);
+  const [cropImageCandidate, setCropImageCandidate] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -146,6 +153,9 @@ export const ProductPhotoCapture: React.FC<ProductPhotoCaptureProps> = ({
         // ignore
       }
       setCapturedSnapshot(snapshot);
+      // Immediately offer the interactive crop tool to frame the item
+      setCropImageCandidate(snapshot);
+      setIsCropModalOpen(true);
     }
   };
 
@@ -158,6 +168,7 @@ export const ProductPhotoCapture: React.FC<ProductPhotoCaptureProps> = ({
 
   const handleRetake = () => {
     setCapturedSnapshot(null);
+    setCropImageCandidate(null);
     if (!cameraActive) {
       startCamera(facingMode);
     }
@@ -169,14 +180,15 @@ export const ProductPhotoCapture: React.FC<ProductPhotoCaptureProps> = ({
 
     const reader = new FileReader();
     reader.onload = (event) => {
-      const img = new Image();
-      img.onload = () => {
-        const compressed = compressImage(img, img.width, img.height);
-        onChange(compressed);
-      };
-      img.src = event.target?.result as string;
+      const rawDataUrl = event.target?.result as string;
+      if (rawDataUrl) {
+        // Open crop modal directly so user has full control over framing
+        setCropImageCandidate(rawDataUrl);
+        setIsCropModalOpen(true);
+      }
     };
     reader.readAsDataURL(file);
+    e.target.value = '';
   };
 
   const handleRemovePhoto = () => {
@@ -194,15 +206,15 @@ export const ProductPhotoCapture: React.FC<ProductPhotoCaptureProps> = ({
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
-        <label className="text-stone-800 font-bold text-xs flex items-center gap-1.5">
-          <Camera className="w-3.5 h-3.5 text-blue-600" />
+        <label className="text-stone-800 dark:text-stone-200 font-bold text-xs flex items-center gap-1.5">
+          <Camera className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
           <span>{label}</span>
         </label>
         {imageUrl && (
           <button
             type="button"
             onClick={handleRemovePhoto}
-            className="text-[11px] text-rose-600 hover:text-rose-700 font-bold flex items-center gap-1 transition"
+            className="text-[11px] text-rose-600 hover:text-rose-700 dark:text-rose-400 font-bold flex items-center gap-1 transition"
           >
             <Trash2 className="w-3 h-3" />
             <span>Remove Photo</span>
@@ -212,35 +224,57 @@ export const ProductPhotoCapture: React.FC<ProductPhotoCaptureProps> = ({
 
       {/* If an image is already set, show clear preview tile */}
       {imageUrl ? (
-        <div className="relative border border-stone-200 rounded-xl p-2.5 bg-stone-50 flex items-center gap-3 shadow-2xs">
+        <div className="relative border border-stone-200 dark:border-stone-700 rounded-xl p-2.5 bg-stone-50 dark:bg-stone-850 flex items-center gap-3 shadow-2xs">
           <img
             src={imageUrl}
             alt="Product Preview"
-            className="w-16 h-16 sm:w-20 sm:h-20 object-cover rounded-lg border border-stone-200 bg-white shrink-0"
+            className="w-16 h-16 sm:w-20 sm:h-20 object-cover rounded-lg border border-stone-200 dark:border-stone-700 bg-white dark:bg-stone-900 shrink-0"
           />
           <div className="flex-1 text-xs min-w-0">
-            <div className="font-bold text-stone-900 flex items-center gap-1">
-              <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+            <div className="font-bold text-stone-900 dark:text-stone-100 flex items-center gap-1">
+              <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
               <span>Photo Attached</span>
             </div>
-            <p className="text-stone-500 text-[11px] mt-0.5 line-clamp-2">
+            <p className="text-stone-500 dark:text-stone-400 text-[11px] mt-0.5 line-clamp-2">
               Appears on POS register catalog tiles, inventory list, and printed receipts.
             </p>
-            <div className="flex items-center gap-2 mt-2">
+            <div className="flex flex-wrap items-center gap-1.5 mt-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setCropImageCandidate(imageUrl);
+                  setIsCropModalOpen(true);
+                }}
+                className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-black flex items-center gap-1.5 transition shadow-xs"
+                title="Crop and reposition this photo"
+              >
+                <Crop className="w-3.5 h-3.5" />
+                <span>Crop / Frame Photo</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => nativeCameraInputRef.current?.click()}
+                className="px-2.5 py-1 bg-white dark:bg-stone-800 hover:bg-stone-100 dark:hover:bg-stone-750 text-stone-800 dark:text-stone-200 border border-stone-300 dark:border-stone-600 rounded-lg text-[10px] font-bold flex items-center gap-1 transition shadow-2xs"
+                title="Take photo with iPhone Camera"
+              >
+                <Smartphone className="w-3 h-3 text-blue-600 dark:text-blue-400" />
+                <span>iPhone Cam</span>
+              </button>
               <button
                 type="button"
                 onClick={handleOpenFullCamera}
-                className="px-2.5 py-1 bg-white hover:bg-stone-100 text-stone-800 border border-stone-300 rounded-lg text-[10px] font-bold flex items-center gap-1 transition shadow-2xs"
+                className="px-2.5 py-1 bg-white dark:bg-stone-800 hover:bg-stone-100 dark:hover:bg-stone-750 text-stone-800 dark:text-stone-200 border border-stone-300 dark:border-stone-600 rounded-lg text-[10px] font-bold flex items-center gap-1 transition shadow-2xs"
+                title="Retake with live in-app viewfinder"
               >
-                <Camera className="w-3 h-3 text-blue-600" />
-                <span>Retake with Camera</span>
+                <Camera className="w-3 h-3 text-amber-500" />
+                <span>Live Cam</span>
               </button>
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
-                className="px-2.5 py-1 bg-white hover:bg-stone-100 text-stone-800 border border-stone-300 rounded-lg text-[10px] font-bold flex items-center gap-1 transition shadow-2xs"
+                className="px-2.5 py-1 bg-white dark:bg-stone-800 hover:bg-stone-100 dark:hover:bg-stone-750 text-stone-800 dark:text-stone-200 border border-stone-300 dark:border-stone-600 rounded-lg text-[10px] font-bold flex items-center gap-1 transition shadow-2xs"
               >
-                <Upload className="w-3 h-3 text-stone-600" />
+                <Upload className="w-3 h-3 text-stone-600 dark:text-stone-400" />
                 <span>Upload New</span>
               </button>
             </div>
@@ -248,28 +282,51 @@ export const ProductPhotoCapture: React.FC<ProductPhotoCaptureProps> = ({
         </div>
       ) : (
         /* Action buttons to capture photo */
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          {/* Main Button: Open Full-Screen Camera */}
-          <button
-            type="button"
-            onClick={handleOpenFullCamera}
-            className="p-3 bg-blue-600 hover:bg-blue-700 active:scale-[0.98] text-white rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition shadow-xs"
-          >
-            <Camera className="w-4 h-4" />
-            <span>Open Camera & Take Photo</span>
-          </button>
+        <div className="space-y-2">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {/* Native iPhone / Mobile Camera */}
+            <button
+              type="button"
+              onClick={() => nativeCameraInputRef.current?.click()}
+              className="p-3 bg-blue-600 hover:bg-blue-700 active:scale-[0.98] text-white rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition shadow-xs"
+              title="Opens iPhone camera with auto-focus and flash, then opens Crop tool"
+            >
+              <Smartphone className="w-4 h-4" />
+              <span>Take Photo (iPhone Camera)</span>
+            </button>
 
-          {/* Upload Button */}
+            {/* In-App Live Camera Viewfinder */}
+            <button
+              type="button"
+              onClick={handleOpenFullCamera}
+              className="p-3 bg-stone-850 dark:bg-stone-800 hover:bg-stone-800 dark:hover:bg-stone-700 active:scale-[0.98] text-white rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition shadow-xs border border-stone-700"
+              title="Live interactive camera with framing guide"
+            >
+              <Camera className="w-4 h-4 text-amber-400" />
+              <span>Live In-App Camera</span>
+            </button>
+          </div>
+
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            className="p-3 bg-stone-100 hover:bg-stone-200 active:scale-[0.98] text-stone-800 rounded-xl font-bold text-xs flex items-center justify-center gap-2 border border-stone-300 transition"
+            className="w-full py-2 bg-stone-100 dark:bg-stone-850 hover:bg-stone-200 dark:hover:bg-stone-800 active:scale-[0.98] text-stone-700 dark:text-stone-300 rounded-xl font-bold text-xs flex items-center justify-center gap-2 border border-stone-200 dark:border-stone-750 transition"
           >
-            <Upload className="w-4 h-4 text-stone-600" />
-            <span>Upload from Gallery / Files</span>
+            <Upload className="w-3.5 h-3.5 text-stone-500" />
+            <span>Upload from Gallery / Files (with Crop Option)</span>
           </button>
         </div>
       )}
+
+      {/* Native Camera Input (triggers native iOS Camera on iPhones) */}
+      <input
+        ref={nativeCameraInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="hidden"
+        onChange={handleFileChange}
+      />
 
       {/* Hidden File Input for Gallery / Local Drive */}
       <input
@@ -392,23 +449,36 @@ export const ProductPhotoCapture: React.FC<ProductPhotoCaptureProps> = ({
           {/* Bottom Controls Bar */}
           <div className="p-6 bg-gradient-to-t from-black/90 to-transparent flex items-center justify-around z-10">
             {capturedSnapshot ? (
-              /* Review Buttons */
-              <div className="flex items-center gap-4 w-full max-w-md mx-auto justify-between">
+              /* Review Buttons with Crop Option */
+              <div className="flex items-center gap-2.5 w-full max-w-lg mx-auto justify-between">
                 <button
                   type="button"
                   onClick={handleRetake}
-                  className="flex-1 py-3.5 px-4 bg-white/20 hover:bg-white/30 backdrop-blur-md text-white rounded-2xl font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition active:scale-95"
+                  className="py-3 px-3 bg-white/20 hover:bg-white/30 backdrop-blur-md text-white rounded-2xl font-bold text-xs flex items-center justify-center gap-1.5 transition active:scale-95"
                 >
                   <RotateCcw className="w-4 h-4" />
                   <span>Retake</span>
                 </button>
                 <button
                   type="button"
-                  onClick={handleConfirmCapturedPhoto}
-                  className="flex-1 py-3.5 px-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black text-xs sm:text-sm flex items-center justify-center gap-2 transition shadow-lg active:scale-95"
+                  onClick={() => {
+                    if (capturedSnapshot) {
+                      setCropImageCandidate(capturedSnapshot);
+                      setIsCropModalOpen(true);
+                    }
+                  }}
+                  className="flex-1 py-3 px-3 bg-blue-600 hover:bg-blue-500 text-white rounded-2xl font-black text-xs flex items-center justify-center gap-1.5 transition shadow-lg active:scale-95"
                 >
-                  <Check className="w-5 h-5" />
-                  <span>Use This Photo</span>
+                  <Crop className="w-4 h-4" />
+                  <span>Crop & Frame</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmCapturedPhoto}
+                  className="flex-1 py-3 px-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black text-xs flex items-center justify-center gap-1.5 transition shadow-lg active:scale-95"
+                >
+                  <Check className="w-4 h-4" />
+                  <span>Use As-Is</span>
                 </button>
               </div>
             ) : (
@@ -450,6 +520,22 @@ export const ProductPhotoCapture: React.FC<ProductPhotoCaptureProps> = ({
           </div>
         </div>
       )}
+
+      {/* Interactive Photo Crop Modal */}
+      <ImageCropModal
+        isOpen={isCropModalOpen}
+        imageSrc={cropImageCandidate}
+        onClose={() => {
+          setIsCropModalOpen(false);
+          setCropImageCandidate(null);
+        }}
+        onCropComplete={(croppedDataUrl) => {
+          onChange(croppedDataUrl);
+          setIsCropModalOpen(false);
+          setCropImageCandidate(null);
+          handleCloseCamera();
+        }}
+      />
     </div>
   );
 };
